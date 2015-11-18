@@ -358,7 +358,7 @@ Run the following command to install aliyuncli(omit the ‘sudo’ on Windows)
    $ aliyuncli ecs help
    ```
 
-4. Navigate to the AliCloud console to create access credentials: https://home.console.alicloud.com/#/
+4. Navigate to the AliCloud console to create access credentials: https://home.console.aliyun.com/#/
    * Login first
    * Click on "AccessKeys" (top right)
    * Click on "Create Access Key", copy and store the "Access Key ID" and "Access Key Secret" to a safe place.
