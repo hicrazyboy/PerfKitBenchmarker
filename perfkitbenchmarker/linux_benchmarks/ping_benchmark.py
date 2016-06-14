@@ -31,17 +31,9 @@ ping:
       or internal IP address
   vm_groups:
     vm_1:
-<<<<<<< HEAD
-      vm_spec: *default_single_core
-      vm_count: 1
-    vm_2:
-      vm_spec: *default_single_core
-      vm_count: 1
-=======
       vm_spec: *default_single_core
     vm_2:
       vm_spec: *default_single_core
->>>>>>> ee0276d4a108ce7867e16fa3357cc990d9d6a103
 """
 
 
@@ -81,36 +73,6 @@ def Run(benchmark_spec):
   Returns:
     A list of sample.Sample objects.
   """
-<<<<<<< HEAD
-  results = []
-  vms = benchmark_spec.vms
-  for vm_idx1 in range(0, len(vms)):
-    for vm_idx2 in range(vm_idx1+1, len(vms)):
-      # if not vms[vm_idx1].IsPubReachable(vms[vm_idx2]):
-      #   logging.warn('%s is not reachable from %s', vms[vm_idx2], vms[vm_idx1])
-      #   return []
-      vm = vms[vm_idx1]
-      logging.info('Ping results:')
-      metadata = {}
-      if FLAGS.ping_use_external_ip == True:
-        ping_cmd = 'ping -c 250 -i 1 %s' % vms[vm_idx2].ip_address
-        metadata['ip_type'] = 'external'
-#        metadata['from'] = ALI_REGIONS[vms[vm_idx1].ip_address]+'_'+vms[vm_idx1].ip_address
-#        metadata['to'] = ALI_REGIONS[vms[vm_idx2].ip_address]+'_'+vms[vm_idx2].ip_address
-      else:
-        ping_cmd = 'ping -c 250 -i 1 %s' % vms[vm_idx2].internal_ip
-        metadata['ip_type'] = 'internal'
-#        metadata['from'] = ALI_REGIONS[vms[vm_idx1].internal_ip]+'_'+vms[vm_idx1].internal_ip
-#        metadata['to'] = ALI_REGIONS[vms[vm_idx2].internal_ip]+'_'+vms[vm_idx2].internal_ip
-      stdout, _ = vm.RemoteCommand(ping_cmd, should_log=True)
-      stats = re.findall('([0-9]*\\.[0-9]*)', stdout.splitlines()[-1])
-      stats += re.findall('([0-9]*\\.?[0-9]*)%', stdout.splitlines()[-2])
-      assert len(stats) == len(METRICS), stats
-
-      for i, metric in enumerate(METRICS[:-1]):
-        results.append(sample.Sample(metric, float(stats[i]), 'ms', metadata))
-      results.append(sample.Sample(METRICS[-1], float(stats[-1]), '%', metadata))
-=======
   vms = benchmark_spec.vms
   results = []
   for sending_vm, receiving_vm in vms, reversed(vms):
@@ -147,7 +109,6 @@ def _RunPing(sending_vm, receiving_vm, receiving_ip, ip_type):
               'sending_zone': sending_vm.zone}
   for i, metric in enumerate(METRICS):
     results.append(sample.Sample(metric, float(stats[i]), 'ms', metadata))
->>>>>>> ee0276d4a108ce7867e16fa3357cc990d9d6a103
   return results
 
 
