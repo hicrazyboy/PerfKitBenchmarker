@@ -1,0 +1,106 @@
+# File: network_config.yaml
+# Regions:
+#    cn-beijing	cn-qingdao	cn-shanghai	cn-hangzhou	cn-shenzhen	cn-hongkong	ap-southeast-1	us-west-1
+#    ap-southeast-1
+#    cn-shenzhen
+#    cn-qingdao
+#    cn-beijing
+#    cn-shanghai
+#    cn-hongkong
+#    cn-hangzhou
+#    us-west-1
+# ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDuq/k7M0pcdRG4xtnwLzJkuBFmdzMNOqk83BbnAA7jZnTUIDwaMyvbn9qQTvROpsP5vo4xalnG+f6LgmpB5f5JC60Zk4tWLyiF1R/9eHlt3ipXTw01Fj2xlpGHYjRehRZlK4Gog27f1uDZRdyqajzfcUkN2P56dLyG4J6dLdrxuH7SX3vkQ0/C5kVWCvjIMDWhN8YA07kfMHUnTmY5UsjySkapechirmDfnWF4heEvVv8ir55iLAT+Evpb2QcVh7wg2De0zFsAtylzjbDoVhQQDTZMKqTzM8VR13Em6AHEZNXpHXwOsqwot4pAiV4e6yL0JyQocyDD7IARVBNHEXL9 cangya@gaolonggldeMacBook-Air.local
+# mkdir .ssh;echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDuq/k7M0pcdRG4xtnwLzJkuBFmdzMNOqk83BbnAA7jZnTUIDwaMyvbn9qQTvROpsP5vo4xalnG+f6LgmpB5f5JC60Zk4tWLyiF1R/9eHlt3ipXTw01Fj2xlpGHYjRehRZlK4Gog27f1uDZRdyqajzfcUkN2P56dLyG4J6dLdrxuH7SX3vkQ0/C5kVWCvjIMDWhN8YA07kfMHUnTmY5UsjySkapechirmDfnWF4heEvVv8ir55iLAT+Evpb2QcVh7wg2De0zFsAtylzjbDoVhQQDTZMKqTzM8VR13Em6AHEZNXpHXwOsqwot4pAiV4e6yL0JyQocyDD7IARVBNHEXL9 cangya@gaolonggldeMacBook-Air.local" > .ssh/authorized_keys
+# /Users/cangya/workspace/perfkit_keyfile/iperf/perfkitbenchmarker_keyfile
+
+# us-west / ap-southeast-1 use static vms
+# ssh -A -p 22 iperf@47.88.27.159 -2 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o ConnectTimeout=5 -o GSSAPIAuthentication=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /Users/cangya/workspace/perfkit_keyfile/iperf/perfkitbenchmarker_keyfile
+# ssh -A -p 22 root@47.88.148.192 -2 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o ConnectTimeout=5 -o GSSAPIAuthentication=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /Users/cangya/workspace/perfkit_keyfile/iperf/perfkitbenchmarker_keyfile
+# ssh -A -p 22 iperf@58.96.186.41 -2 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o ConnectTimeout=5 -o GSSAPIAuthentication=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i /Users/cangya/workspace/perfkit_keyfile/iperf/perfkitbenchmarker_keyfile
+static_vms:
+  - &ap_southeast_vm1
+    user_name: root
+    ssh_private_key: /Users/cangya/workspace/perfkit_keyfile/iperf/perfkitbenchmarker_keyfile
+    ip_address: 47.88.136.71
+    os_type: debian
+  - &cn_shenzhen_vm1
+    user_name: root
+    ssh_private_key: /Users/cangya/workspace/perfkit_keyfile/iperf/perfkitbenchmarker_keyfile
+    ip_address: 120.24.41.220
+    os_type: debian
+  - &cn_qingdao_vm1
+    user_name: root
+    ssh_private_key: /Users/cangya/workspace/perfkit_keyfile/iperf/perfkitbenchmarker_keyfile
+    ip_address:
+    os_type: debian
+  - &cn_beijing_vm1
+    user_name: root
+    ssh_private_key: /Users/cangya/workspace/perfkit_keyfile/iperf/perfkitbenchmarker_keyfile
+    ip_address: 182.92.199.195
+    os_type: debian
+  - &cn_shanghai_vm1
+    user_name: root
+    ssh_private_key: /Users/cangya/workspace/perfkit_keyfile/iperf/perfkitbenchmarker_keyfile
+    ip_address: 139.196.173.111
+    os_type: debian
+  - &cn_hongkong_vm1
+    user_name: root
+    ssh_private_key: /Users/cangya/workspace/perfkit_keyfile/iperf/perfkitbenchmarker_keyfile
+    ip_address: 47.89.31.122
+    os_type: debian
+  - &cn_hangzhou_vm1
+    user_name: root
+    ssh_private_key: /Users/cangya/workspace/perfkit_keyfile/iperf/perfkitbenchmarker_keyfile
+    ip_address: 121.41.19.233
+    os_type: debian
+  - &us_west_vm1
+    user_name: root
+    ssh_private_key: /Users/cangya/workspace/perfkit_keyfile/iperf/perfkitbenchmarker_keyfile
+    ip_address: 47.88.84.252
+    os_type: debian
+
+
+ping: &ping_muti
+  flags:
+    ping_use_external_ip: True
+  vm_groups:
+    vm_1:
+      static_vms:
+        - *ap_southeast_vm1
+    vm_2:
+      static_vms:
+        - *us_west_vm1
+#    vm_3:
+#      static_vms:
+#        - *cn_hangzhou_vm1
+#    vm_4:
+#      static_vms:
+#        - *cn_beijing_vm1
+#    vm_5:
+#      static_vms:
+#        - *cn_hongkong_vm1
+#    vm_6:
+#      static_vms:
+#        - *cn_shenzhen_vm1
+#    vm_7:
+#      static_vms:
+#        - *cn_shanghai_vm1
+#    vm_8:
+#      static_vms:
+#        - *cn_qingdao_vm1
+
+
+# If you choose to, you can specify which benchmarks should be
+# run in your config file. This will even let you run the same
+# benchmark multiple times with different configs.
+benchmarks:
+#  - iperf: *iperf_singapore_hangzhou
+#  - netperf: *netperf_hangzhou_singapore
+#  - iperf: *iperf_two_core_aws
+
+#  - mesh_network: *mesh_network_ali
+#  - mesh_network: *mesh_network_aws
+
+  - ping: *ping_muti
+
+

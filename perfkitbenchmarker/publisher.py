@@ -139,17 +139,33 @@ class DefaultMetadataProvider(MetadataProvider):
       name_prefix = '' if name == 'default' else name + '_'
       metadata[name_prefix + 'cloud'] = vm.CLOUD
       metadata[name_prefix + 'zone'] = vm.zone
-      metadata[name_prefix + 'machine_type'] = vm.machine_type
       metadata[name_prefix + 'image'] = vm.image
+      for k, v in vm.GetMachineTypeDict().iteritems():
+        metadata[name_prefix + k] = v
+      metadata[name_prefix + 'vm_count'] = len(vms)
 
       if vm.scratch_disks:
         data_disk = vm.scratch_disks[0]
+        # Legacy metadata keys
         metadata[name_prefix + 'scratch_disk_type'] = data_disk.disk_type
         metadata[name_prefix + 'scratch_disk_size'] = data_disk.disk_size
         metadata[name_prefix + 'num_striped_disks'] = (
             data_disk.num_striped_disks)
-        if data_disk.disk_type == disk.PIOPS:
+        if getattr(data_disk, 'iops', None) is not None:
           metadata[name_prefix + 'scratch_disk_iops'] = data_disk.iops
+          metadata[name_prefix + 'aws_provisioned_iops'] = data_disk.iops
+        # Modern metadata keys
+        metadata[name_prefix + 'data_disk_0_type'] = data_disk.disk_type
+        metadata[name_prefix + 'data_disk_0_size'] = (
+            data_disk.disk_size * data_disk.num_striped_disks)
+        metadata[name_prefix + 'data_disk_0_num_stripes'] = (
+            data_disk.num_striped_disks)
+        if getattr(data_disk, 'metadata', None) is not None:
+          if disk.LEGACY_DISK_TYPE in data_disk.metadata:
+            metadata[name_prefix + 'scratch_disk_type'] = (
+                data_disk.metadata[disk.LEGACY_DISK_TYPE])
+          for key, value in data_disk.metadata.iteritems():
+            metadata[name_prefix + 'data_disk_0_' + key] = value
 
     # User specified metadata
     for pair in FLAGS.metadata:

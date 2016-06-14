@@ -74,10 +74,10 @@ WINDOWS = 'windows'
 UBUNTU_CONTAINER = 'ubuntu_container'
 
 FLAGS = flags.FLAGS
-
+VALID_CLOUDS = [GCP, AZURE, AWS, DIGITALOCEAN, KUBERNETES, OPENSTACK,
+                RACKSPACE, CLOUDSTACK, ALICLOUD]
 flags.DEFINE_enum('cloud', GCP,
-                  [GCP, AZURE, AWS, DIGITALOCEAN, KUBERNETES, OPENSTACK,
-                   RACKSPACE, CLOUDSTACK, ALICLOUD],
+                  VALID_CLOUDS,
                   'Name of the cloud to use.')
 flags.DEFINE_enum(
     'os_type', DEBIAN, [DEBIAN, RHEL, UBUNTU_CONTAINER, WINDOWS],
@@ -181,6 +181,7 @@ class BenchmarkSpec(object):
 
         os_type = self._GetOsTypeForGroup(group_name)
         cloud = self._GetCloudForGroup(group_name)
+        providers.LoadProvider(cloud.lower())
 
         # Then create a VmSpec and possibly a DiskSpec which we can
         # use to create the remaining VMs.
@@ -191,6 +192,14 @@ class BenchmarkSpec(object):
           disk_spec_class = disk.GetDiskSpecClass(cloud)
           disk_spec = disk_spec_class(**group_spec[DISK_SPEC][cloud])
           disk_spec.ApplyFlags(FLAGS)
+          # disk_spec.disk_type may contain legacy values that were
+          # copied from FLAGS.scratch_disk_type into
+          # FLAGS.data_disk_type at the beginning of the run. We
+          # translate them here, rather than earlier, because here is
+          # where we know what cloud we're using and therefore we're
+          # able to pick the right translation table.
+          disk_spec.disk_type = disk.WarnAndTranslateDiskTypes(
+              disk_spec.disk_type, cloud)
         else:
           disk_spec = None
 
@@ -223,10 +232,10 @@ class BenchmarkSpec(object):
     if self.vms:
       vm_util.RunThreaded(self.PrepareVm, self.vms)
       if FLAGS.os_type != WINDOWS:
-        vm_util.GenerateSSHConfig(self.vms)
+        vm_util.GenerateSSHConfig(self)
 
   def Delete(self):
-    if FLAGS.run_stage not in ['all', 'cleanup'] or self.deleted:
+    if self.deleted:
       return
 
     if self.vms:
