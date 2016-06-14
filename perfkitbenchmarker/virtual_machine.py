@@ -591,6 +591,23 @@ class BaseOsMixin(object):
         self._reachable[target_vm] = False
     return self._reachable[target_vm]
 
+  def IsPubReachable(self, target_vm):
+    """Indicates whether the target VM can be reached from it's external ip.
+
+    Args:
+      target_vm: The VM whose reachability is being tested.
+
+    Returns:
+      True if the external ip address of the target VM can be reached, false
+      otherwise.
+    """
+    if target_vm not in self._reachable:
+      if target_vm.ip_address:
+        self._reachable[target_vm] = self._TestReachable(target_vm.ip_address)
+      else:
+        self._reachable[target_vm] = False
+    return self._reachable[target_vm]
+
   @abc.abstractmethod
   def _TestReachable(self, ip):
     """Returns True if the VM can reach the ip address and False otherwise."""

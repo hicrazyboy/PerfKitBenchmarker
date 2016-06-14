@@ -193,8 +193,8 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
     if FLAGS.setup_remote_firewall:
       self.SetupRemoteFirewall()
     if self.install_packages:
-      if self.is_static:
-        self.SnapshotPackages()
+      # if self.is_static:
+        # self.SnapshotPackages()
       self.SetupPackageManager()
     self.BurnCpu()
 
@@ -224,7 +224,7 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
     """
     for package_name in self._installed_packages:
       self.Uninstall(package_name)
-    self.RestorePackages()
+    # self.RestorePackages()
     self.RemoteCommand('rm -rf %s' % vm_util.VM_TMP_DIR)
 
   def GetPathToConfig(self, package_name):
@@ -649,7 +649,8 @@ class DebianMixin(BaseLinuxMixin):
 
   def SetupPackageManager(self):
     """Runs apt-get update so InstallPackages shouldn't need to."""
-    self.AptUpdate()
+    # self.AptUpdate()
+    pass
 
   @vm_util.Retry(max_retries=UPDATE_RETRIES)
   def AptUpdate(self):

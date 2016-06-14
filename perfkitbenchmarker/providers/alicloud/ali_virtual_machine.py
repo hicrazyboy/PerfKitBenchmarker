@@ -136,12 +136,14 @@ class AliVirtualMachine(virtual_machine.BaseVirtualMachine):
     status = EipAddresses[0]['Status']
     assert status in status_list
 
+  @vm_util.Retry(poll_interval=5, max_retries=30, log_errors=False)
   def _AllocatePubIp(self, region, instance_id):
     """Allocate a public ip address and associate it to the instance"""
     if FLAGS.ali_use_vpc:
       allocatip_cmd = util.ALI_PREFIX + [
           'ecs',
           'AllocateEipAddress',
+          '--Bandwidth 200',
           '--RegionId %s' % region,
           '--InternetChargeType PayByTraffic']
       allocatip_cmd = util.GetEncodedCmd(allocatip_cmd)
