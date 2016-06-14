@@ -713,12 +713,6 @@ class DebianMixin(BaseLinuxMixin):
 
   OS_TYPE = os_types.DEBIAN
 
-<<<<<<< HEAD
-  def SetupPackageManager(self):
-    """Runs apt-get update so InstallPackages shouldn't need to."""
-    # self.AptUpdate()
-    pass
-=======
   def __init__(self, *args, **kwargs):
     super(DebianMixin, self).__init__(*args, **kwargs)
 
@@ -726,7 +720,6 @@ class DebianMixin(BaseLinuxMixin):
     # We defer running apt-get update until the first request to install a
     # package.
     self._apt_updated = False
->>>>>>> ee0276d4a108ce7867e16fa3357cc990d9d6a103
 
   @vm_util.Retry(max_retries=UPDATE_RETRIES)
   def AptUpdate(self):
