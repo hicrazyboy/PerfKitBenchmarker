@@ -18,21 +18,41 @@ import unittest
 
 import mock
 
-from perfkitbenchmarker import benchmark_spec
 from perfkitbenchmarker import providers
+from perfkitbenchmarker import requirements
+from perfkitbenchmarker.configs import benchmark_config_spec
+from tests import mock_flags
 
 
 class LoadProvidersTestCase(unittest.TestCase):
 
-  def testLoadAllProviders(self):
-    for cloud in benchmark_spec.VALID_CLOUDS:
-      providers.LoadProvider(cloud.lower())
+  def setUp(self):
+    p = mock.patch.object(providers, '_imported_providers', new=set())
+    p.start()
+    self.addCleanup(p.stop)
+
+  def testImportAllProviders(self):
+    # Test that all modules can be imported successfully, but mock out the call
+    # to provider_imported event handlers.
+    with mock.patch.object(providers.events.provider_imported, 'send'):
+      for cloud in providers.VALID_CLOUDS:
+        providers.LoadProvider(cloud)
 
   def testLoadInvalidProvider(self):
     with self.assertRaises(ImportError):
       providers.LoadProvider('InvalidCloud')
 
-  def testBenchmarkSpecLoadsProvider(self):
+  def testLoadProviderChecksRequirements(self):
+    with mock.patch(requirements.__name__ + '.CheckProviderRequirements'):
+      providers.LoadProvider('GCP', ignore_package_requirements=False)
+      requirements.CheckProviderRequirements.assert_called_once_with('gcp')
+
+  def testLoadProviderIgnoresRequirements(self):
+    with mock.patch(requirements.__name__ + '.CheckProviderRequirements'):
+      providers.LoadProvider('GCP')
+      requirements.CheckProviderRequirements.assert_not_called()
+
+  def testBenchmarkConfigSpecLoadsProvider(self):
     p = mock.patch(providers.__name__ + '.LoadProvider')
     p.start()
     self.addCleanup(p.stop)
@@ -40,11 +60,13 @@ class LoadProvidersTestCase(unittest.TestCase):
         'vm_groups': {
             'group1': {
                 'cloud': 'AWS',
+                'os_type': 'debian',
                 'vm_count': 0,
                 'vm_spec': {'AWS': {}}
             }
         }
     }
-    spec = benchmark_spec.BenchmarkSpec(config, 'name', 'uid')
-    spec.ConstructVirtualMachines()
-    providers.LoadProvider.assert_called_with('aws')
+    with mock_flags.PatchFlags() as mocked_flags:
+      benchmark_config_spec.BenchmarkConfigSpec(
+          'name', flag_values=mocked_flags, **config)
+    providers.LoadProvider.assert_called_with('AWS', True)

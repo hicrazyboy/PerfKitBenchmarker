@@ -17,7 +17,13 @@
 import logging
 import re
 
+import yaml
+
 from perfkitbenchmarker import flags
+from perfkitbenchmarker import units
+
+
+FLAGS = flags.FLAGS
 
 INTEGER_GROUP_REGEXP = re.compile(r'(\d+)(-(\d+))?$')
 
@@ -89,6 +95,9 @@ class IntegerList(object):
         low, high = group
         for val in xrange(low, high + 1):
           yield val
+
+  def __str__(self):
+      return IntegerListSerializer().Serialize(self)
 
 
 class IntegerListParser(flags.ArgumentParser):
@@ -180,10 +189,275 @@ class IntegerListSerializer(flags.ArgumentSerializer):
 
 
 def DEFINE_integerlist(name, default, help, on_nonincreasing=None,
-                       flag_values=flags.GLOBAL_FLAGS, **args):
+                       flag_values=FLAGS, **kwargs):
   """Register a flag whose value must be an integer list."""
 
   parser = IntegerListParser(on_nonincreasing=on_nonincreasing)
   serializer = IntegerListSerializer()
 
-  flags.DEFINE(parser, name, default, help, flag_values, serializer, **args)
+  flags.DEFINE(parser, name, default, help, flag_values, serializer, **kwargs)
+
+
+class FlagDictSubstitution(object):
+  """Context manager that redirects flag reads and writes."""
+
+  def __init__(self, flag_values, substitute):
+    """Initializes a FlagDictSubstitution.
+
+    Args:
+      flag_values: FlagValues that is temporarily modified such that all its
+          flag reads and writes are redirected.
+      substitute: Callable that temporarily replaces the FlagDict function of
+          flag_values. Accepts no arguments and returns a dict mapping flag
+          name string to Flag object.
+    """
+    self._flags = flag_values
+    self._substitute = substitute
+
+  def __enter__(self):
+    """Begins the flag substitution."""
+    self._original_flagdict = self._flags.FlagDict
+    self._flags.__dict__['FlagDict'] = self._substitute
+
+  def __exit__(self, *unused_args, **unused_kwargs):
+    """Stops the flag substitution."""
+    self._flags.__dict__['FlagDict'] = self._original_flagdict
+
+
+class UnitsParser(flags.ArgumentParser):
+  """Parse a flag containing a unit expression.
+
+  Attributes:
+    convertible_to: list of units.Unit instances. A parsed expression must be
+        convertible to at least one of the Units in this list. For example,
+        if the parser requires that its inputs are convertible to bits, then
+        values expressed in KiB and GB are valid, but values expressed in meters
+        are not.
+  """
+
+  syntactic_help = ('A quantity with a unit. Ex: 12.3MB.')
+
+  def __init__(self, convertible_to):
+    """Initialize the UnitsParser.
+
+    Args:
+      convertible_to: Either an individual unit specification or a series of
+          unit specifications, where each unit specification is either a string
+          (e.g. 'byte') or a units.Unit. The parser input must be convertible to
+          at least one of the specified Units, or the Parse() method will raise
+          a ValueError.
+    """
+    if isinstance(convertible_to, (basestring, units.Unit)):
+      self.convertible_to = [units.Unit(convertible_to)]
+    else:
+      self.convertible_to = [units.Unit(u) for u in convertible_to]
+
+  def Parse(self, inp):
+    """Parse the input.
+
+    Args:
+      inp: a string or a units.Quantity. If a string, it has the format
+          "<number><units>", as in "12KB", or "2.5GB".
+
+    Returns:
+      A units.Quantity.
+
+    Raises:
+      ValueError: If the input cannot be parsed, or if it parses to a value with
+          improper units.
+    """
+    if isinstance(inp, units.Quantity):
+      quantity = inp
+    else:
+      try:
+        quantity = units.ParseExpression(inp)
+      except Exception as e:
+        raise ValueError("Couldn't parse unit expression %r: %s" %
+                         (inp, e.message))
+      if not isinstance(quantity, units.Quantity):
+        raise ValueError('Expression %r evaluates to a unitless value.' % inp)
+
+    for unit in self.convertible_to:
+      try:
+        quantity.to(unit)
+        break
+      except units.DimensionalityError:
+        pass
+    else:
+      raise ValueError(
+          'Expression {0!r} is not convertible to an acceptable unit '
+          '({1}).'.format(inp, ', '.join(str(u) for u in self.convertible_to)))
+
+    return quantity
+
+
+class UnitsSerializer(flags.ArgumentSerializer):
+  def Serialize(self, units):
+    return str(units)
+
+
+def DEFINE_units(name, default, help, convertible_to,
+                 flag_values=flags.FLAGS, **kwargs):
+  """Register a flag whose value is a units expression.
+
+  Args:
+    name: string. The name of the flag.
+    default: units.Quantity. The default value.
+    help: string. A help message for the user.
+    convertible_to: Either an individual unit specification or a series of unit
+        specifications, where each unit specification is either a string (e.g.
+        'byte') or a units.Unit. The flag value must be convertible to at least
+        one of the specified Units to be considered valid.
+    flag_values: the gflags.FlagValues object to define the flag in.
+  """
+  parser = UnitsParser(convertible_to=convertible_to)
+  serializer = UnitsSerializer()
+  flags.DEFINE(parser, name, default, help, flag_values, serializer, **kwargs)
+
+
+def StringToBytes(string):
+  """Convert an object size, represented as a string, to bytes.
+
+  Args:
+    string: the object size, as a string with a quantity and a unit.
+
+  Returns:
+    an integer. The number of bytes in the size.
+
+  Raises:
+    ValueError, if either the string does not represent an object size
+    or if the size does not contain an integer number of bytes.
+  """
+
+  try:
+    quantity = units.ParseExpression(string)
+  except Exception:
+    # Catching all exceptions is ugly, but we don't know what sort of
+    # exception pint might throw, and we want to turn any of them into
+    # ValueError.
+    raise ValueError("Couldn't parse size %s" % string)
+
+  try:
+    bytes = quantity.m_as(units.byte)
+  except units.DimensionalityError:
+    raise ValueError("Quantity %s is not a size" % string)
+
+  if bytes != int(bytes):
+    raise ValueError("Size %s has a non-integer number (%s) of bytes!" %
+                     (string, bytes))
+
+  if bytes < 0:
+    raise ValueError("Size %s has a negative number of bytes!" % string)
+
+  return int(bytes)
+
+
+def StringToRawPercent(string):
+  """Convert a string to a raw percentage value.
+
+  Args:
+    string: the percentage, with '%' on the end.
+
+  Returns:
+    A floating-point number, holding the percentage value.
+
+  Raises:
+    ValueError, if the string can't be read as a percentage.
+  """
+
+  if len(string) <= 1:
+    raise ValueError("String '%s' too short to be percentage." % string)
+
+  if string[-1] != '%':
+    raise ValueError("Percentage '%s' must end with '%%'" % string)
+
+  # This will raise a ValueError if it can't convert the string to a float.
+  val = float(string[:-1])
+
+  if val < 0.0 or val > 100.0:
+    raise ValueError('Quantity %s is not a valid percentage' % val)
+
+  return val
+
+
+# The YAML flag type is necessary because flags can be read either via
+# the command line or from a config file. If they come from a config
+# file, they will already be parsed as YAML, but if they come from the
+# command line, they will be raw strings. The point of this flag is to
+# guarantee a consistent representation to the rest of the program.
+class YAMLParser(flags.ArgumentParser):
+  """Parse a flag containing YAML."""
+
+  syntactic_help = 'A YAML expression.'
+
+  def Parse(self, inp):
+    """Parse the input.
+
+    Args:
+      inp. A string or the result of yaml.load. If a string, should be
+      a valid YAML document.
+    """
+
+    if isinstance(inp, basestring):
+      # This will work unless the user writes a config with a quoted
+      # string that, if unquoted, would be parsed as a non-string
+      # Python type (example: '123'). In that case, the first
+      # yaml.load() in the config system will strip away the quotation
+      # marks, and this second yaml.load() will parse it as the
+      # non-string type. However, I think this is the best we can do
+      # without significant changes to the config system, and the
+      # problem is unlikely to occur in PKB.
+      try:
+        return yaml.load(inp)
+      except yaml.YAMLError as e:
+        raise ValueError("Couldn't parse YAML string '%s': %s" %
+                         (inp, e.message))
+    else:
+      return inp
+
+
+class YAMLSerializer(flags.ArgumentSerializer):
+
+  def Serialize(self, val):
+    return yaml.dump(val)
+
+
+def DEFINE_yaml(name, default, help, flag_values=flags.FLAGS, **kwargs):
+  """Register a flag whose value is a YAML expression.
+
+  Args:
+    name: string. The name of the flag.
+    default: object. The default value of the flag.
+    help: string. A help message for the user.
+    flag_values: the gflags.FlagValues object to define the flag in.
+    kwargs: extra arguments to pass to gflags.DEFINE().
+  """
+
+  parser = YAMLParser()
+  serializer = YAMLSerializer()
+
+  flags.DEFINE(parser, name, default, help, flag_values, serializer, **kwargs)
+
+
+def ParseKeyValuePairs(strings):
+  """Parses colon separated key value pairs from a list of strings.
+
+  Pairs should be separated by a comma and key and value by a colon, e.g.,
+  ['k1:v1', 'k2:v2,k3:v3'].
+
+  Args:
+    strings: A list of strings.
+
+  Returns:
+    A dict populated with keys and values from the flag.
+  """
+  pairs = {}
+  for pair in [kv for s in strings for kv in s.split(',')]:
+    try:
+      key, value = pair.split(':')
+      pairs[key] = value
+    except ValueError:
+      logging.error('Bad key value pair format. Skipping "%s".', pair)
+      continue
+
+  return pairs

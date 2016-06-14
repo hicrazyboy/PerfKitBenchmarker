@@ -14,82 +14,65 @@
 
 """Container for all data required for a benchmark to run."""
 
+import contextlib
 import copy
-import logging
-import pickle
 import copy_reg
+import logging
 import os
+import pickle
 import thread
 import threading
 import uuid
 
-from perfkitbenchmarker import configs
 from perfkitbenchmarker import context
 from perfkitbenchmarker import disk
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
+from perfkitbenchmarker import os_types
+from perfkitbenchmarker import provider_info
+from perfkitbenchmarker import providers
+from perfkitbenchmarker import spark_service
 from perfkitbenchmarker import static_virtual_machine as static_vm
 from perfkitbenchmarker import virtual_machine
 from perfkitbenchmarker import vm_util
-from perfkitbenchmarker import providers  # NOQA
 
 
 def PickleLock(lock):
-    return UnPickleLock, (lock.locked(),)
+  return UnPickleLock, (lock.locked(),)
 
 
 def UnPickleLock(locked, *args):
-    lock = threading.Lock()
-    if locked:
-        if not lock.acquire(False):
-            raise pickle.UnpicklingError("Cannot acquire lock")
-    return lock
+  lock = threading.Lock()
+  if locked:
+    if not lock.acquire(False):
+      raise pickle.UnpicklingError('Cannot acquire lock')
+  return lock
 
 
 copy_reg.pickle(thread.LockType, PickleLock)
-# Config constants.
-VM_GROUPS = 'vm_groups'
-CONFIG_FLAGS = 'flags'
-DISK_COUNT = 'disk_count'
-VM_COUNT = 'vm_count'
-DEFAULT_COUNT = 1
-CLOUD = 'cloud'
-OS_TYPE = 'os_type'
-STATIC_VMS = 'static_vms'
-VM_SPEC = 'vm_spec'
-DISK_SPEC = 'disk_spec'
 
-GCP = 'GCP'
-AZURE = 'Azure'
-AWS = 'AWS'
-ALICLOUD = 'AliCloud'
-KUBERNETES = 'Kubernetes'
-DIGITALOCEAN = 'DigitalOcean'
-OPENSTACK = 'OpenStack'
-CLOUDSTACK = 'CloudStack'
-RACKSPACE = 'Rackspace'
-DEBIAN = 'debian'
-RHEL = 'rhel'
-WINDOWS = 'windows'
-UBUNTU_CONTAINER = 'ubuntu_container'
+SUPPORTED = 'strict'
+NOT_EXCLUDED = 'permissive'
+SKIP_CHECK = 'none'
 
 FLAGS = flags.FLAGS
-VALID_CLOUDS = [GCP, AZURE, AWS, DIGITALOCEAN, KUBERNETES, OPENSTACK,
-                RACKSPACE, CLOUDSTACK, ALICLOUD]
-flags.DEFINE_enum('cloud', GCP,
-                  VALID_CLOUDS,
+
+flags.DEFINE_enum('cloud', providers.GCP,
+                  providers.VALID_CLOUDS,
                   'Name of the cloud to use.')
-flags.DEFINE_enum(
-    'os_type', DEBIAN, [DEBIAN, RHEL, UBUNTU_CONTAINER, WINDOWS],
-    'The VM\'s OS type. Ubuntu\'s os_type is "debian" because it is largely '
-    'built on Debian and uses the same package manager. Likewise, CentOS\'s '
-    'os_type is "rhel". In general if two OS\'s use the same package manager, '
-    'and are otherwise very similar, the same os_type should work on both of '
-    'them.')
 flags.DEFINE_string('scratch_dir', None,
                     'Base name for all scratch disk directories in the VM.'
                     'Upon creation, these directories will have numbers'
                     'appended to them (for example /scratch0, /scratch1, etc).')
+flags.DEFINE_enum('benchmark_compatibility_checking', SUPPORTED,
+                  [SUPPORTED, NOT_EXCLUDED, SKIP_CHECK],
+                  'Method used to check compatibility between the benchmark '
+                  ' and the cloud.  ' + SUPPORTED + ' runs the benchmark only'
+                  ' if the cloud provider has declared it supported. ' +
+                  NOT_EXCLUDED + ' runs the benchmark unless it has been '
+                  ' declared not supported by the could provider. ' +
+                  SKIP_CHECK + ' does not do the compatibility'
+                  ' check. The default is ' + SUPPORTED)
 
 
 class BenchmarkSpec(object):
@@ -99,12 +82,12 @@ class BenchmarkSpec(object):
     """Initialize a BenchmarkSpec object.
 
     Args:
-      benchmark_config: A Python dictionary representation of the configuration
-        for the benchmark. For a complete explanation, see
-        perfkitbenchmarker/configs/__init__.py.
+      benchmark_config: BenchmarkConfigSpec. The configuration for the
+          benchmark.
       benchmark_name: string. Name of the benchmark.
       benchmark_uid: An identifier unique to this run of the benchmark even
-        if the same benchmark is run multiple times with different configs.
+          if the same benchmark is run multiple times with different configs.
+      spark_service: The spark service configured for this benchmark.
     """
     self.config = benchmark_config
     self.name = benchmark_name
@@ -119,124 +102,181 @@ class BenchmarkSpec(object):
     self.file_name = os.path.join(vm_util.GetTempDir(), self.uid)
     self.uuid = str(uuid.uuid4())
     self.always_call_cleanup = False
-    self._flags = None
+    self.spark_service = None
 
     # Set the current thread's BenchmarkSpec object to this one.
     context.SetThreadBenchmarkSpec(self)
 
-  @property
-  def FLAGS(self):
-    """Returns the result of merging config flags with the global flags."""
-    if self._flags is None:
-      self._flags = configs.GetMergedFlags(self.config)
-    return self._flags
+  @contextlib.contextmanager
+  def RedirectGlobalFlags(self):
+    """Redirects flag reads and writes to the benchmark-specific flags object.
 
-  def _GetCloudForGroup(self, group_name):
-    """Gets the cloud for a VM group by looking at flags and the config.
-
-    The precedence is as follows (in decreasing order):
-      * FLAGS.cloud (if specified on the command line)
-      * The "cloud" key in the group config (set by a config override)
-      * The "cloud" key in the group config (set by the config file)
-      * FLAGS.cloud (the default value)
+    Within the enclosed code block, reads and writes to the flags.FLAGS object
+    are redirected to a copy that has been merged with config-provided flag
+    overrides specific to this benchmark run.
     """
-    group_spec = self.config[VM_GROUPS][group_name]
-    if not FLAGS[CLOUD].present and CLOUD in group_spec:
-      return group_spec[CLOUD]
-    return FLAGS.cloud
+    with self.config.RedirectFlags(FLAGS):
+      yield
 
-  def _GetOsTypeForGroup(self, group_name):
-    """Gets the OS type for a VM group by looking at flags and the config.
+  def ConstructVirtualMachineGroup(self, group_name, group_spec):
+    """Construct the virtual machine(s) needed for a group."""
+    vms = []
+    zone_index = 0
 
-    The precedence is as follows (in decreasing order):
-      * FLAGS.os_type (if specified on the command line)
-      * The "os_type" key in the group config (set by a config override)
-      * The "os_type" key in the group config (set by the config file)
-      * FLAGS.os_type (the default value)
-    """
-    group_spec = self.config[VM_GROUPS][group_name]
-    if not FLAGS[OS_TYPE].present and OS_TYPE in group_spec:
-      return group_spec[OS_TYPE]
-    return FLAGS.os_type
+    vm_count = group_spec.vm_count
+    disk_count = group_spec.disk_count
+
+    # First create the Static VM objects.
+    if group_spec.static_vms:
+      for vm_spec in group_spec.static_vms[:vm_count]:
+        static_vm_class = static_vm.GetStaticVmClass(vm_spec.os_type)
+        vms.append(static_vm_class(vm_spec))
+
+    os_type = group_spec.os_type
+    cloud = group_spec.cloud
+
+    # This throws an exception if the benchmark is not
+    # supported.
+    self._CheckBenchmarkSupport(cloud)
+
+    # Then create the remaining VM objects using VM and disk specs.
+
+    if group_spec.disk_spec:
+      disk_spec = group_spec.disk_spec
+      # disk_spec.disk_type may contain legacy values that were
+      # copied from FLAGS.scratch_disk_type into
+      # FLAGS.data_disk_type at the beginning of the run. We
+      # translate them here, rather than earlier, because here is
+      # where we know what cloud we're using and therefore we're
+      # able to pick the right translation table.
+      disk_spec.disk_type = disk.WarnAndTranslateDiskTypes(
+          disk_spec.disk_type, cloud)
+    else:
+      disk_spec = None
+
+    for _ in xrange(vm_count - len(vms)):
+      # Assign a zone to each VM sequentially from the --zones flag.
+      if FLAGS.zones:
+        group_spec.vm_spec.zone = FLAGS.zones[zone_index]
+        zone_index = (zone_index + 1 if zone_index < len(FLAGS.zones) - 1
+                      else 0)
+      vm = self._CreateVirtualMachine(group_spec.vm_spec, os_type, cloud)
+      if disk_spec:
+        vm.disk_specs = [copy.copy(disk_spec) for _ in xrange(disk_count)]
+        # In the event that we need to create multiple disks from the same
+        # DiskSpec, we need to ensure that they have different mount points.
+        if (disk_count > 1 and disk_spec.mount_point):
+          for i, spec in enumerate(vm.disk_specs):
+            spec.mount_point += str(i)
+      vms.append(vm)
+
+    return vms
+
+  def _CheckBenchmarkSupport(self, cloud):
+    """ Throw an exception if the benchmark isn't supported."""
+
+    if FLAGS.benchmark_compatibility_checking == SKIP_CHECK:
+      return
+
+    provider_info_class = provider_info.GetProviderInfoClass(cloud)
+    benchmark_ok = provider_info_class.IsBenchmarkSupported(self.name)
+    if FLAGS.benchmark_compatibility_checking == NOT_EXCLUDED:
+      if benchmark_ok is None:
+        benchmark_ok = True
+
+    if not benchmark_ok:
+      raise ValueError('Provider {0} does not support {1}.  Use '
+                       '--benchmark_compatibility_checking=none '
+                       'to override this check.'.format(
+                           provider_info_class.CLOUD,
+                           self.name))
+
+  def _ConstructJujuController(self, group_spec):
+    """Construct a VirtualMachine object for a Juju controller."""
+    juju_spec = copy.copy(group_spec)
+    juju_spec.vm_count = 1
+    jujuvms = self.ConstructVirtualMachineGroup('juju', juju_spec)
+    if len(jujuvms):
+      jujuvm = jujuvms.pop()
+      jujuvm.is_controller = True
+      return jujuvm
+    return None
 
   def ConstructVirtualMachines(self):
     """Constructs the BenchmarkSpec's VirtualMachine objects."""
-    vm_group_specs = self.config[VM_GROUPS]
+    vm_group_specs = self.config.vm_groups
 
-    for group_name, group_spec in vm_group_specs.iteritems():
-      vms = []
-      vm_count = group_spec.get(VM_COUNT, DEFAULT_COUNT)
-      if vm_count is None:
-        vm_count = FLAGS.num_vms
-      disk_count = group_spec.get(DISK_COUNT, DEFAULT_COUNT)
+    clouds = {}
+    for group_name, group_spec in sorted(vm_group_specs.iteritems()):
+      vms = self.ConstructVirtualMachineGroup(group_name, group_spec)
 
-      try:
-        # First create the Static VMs.
-        if STATIC_VMS in group_spec:
-          static_vm_specs = group_spec[STATIC_VMS][:vm_count]
-          for spec_kwargs in static_vm_specs:
-            vm_spec = static_vm.StaticVmSpec(**spec_kwargs)
-            static_vm_class = static_vm.GetStaticVmClass(vm_spec.os_type)
-            vms.append(static_vm_class(vm_spec))
+      if group_spec.os_type == os_types.JUJU:
+          # The Juju VM needs to be created first, so that subsequent units can
+          # be properly added under its control.
+          if group_spec.cloud in clouds:
+            jujuvm = clouds[group_spec.cloud]
+          else:
+            jujuvm = self._ConstructJujuController(group_spec)
+            clouds[group_spec.cloud] = jujuvm
 
-        os_type = self._GetOsTypeForGroup(group_name)
-        cloud = self._GetCloudForGroup(group_name)
-        providers.LoadProvider(cloud.lower())
+          for vm in vms:
+            vm.controller = clouds[group_spec.cloud]
+            vm.vm_group = group_name
 
-        # Then create a VmSpec and possibly a DiskSpec which we can
-        # use to create the remaining VMs.
-        vm_spec_class = virtual_machine.GetVmSpecClass(cloud)
-        vm_spec = vm_spec_class(**group_spec[VM_SPEC][cloud])
-
-        if DISK_SPEC in group_spec:
-          disk_spec_class = disk.GetDiskSpecClass(cloud)
-          disk_spec = disk_spec_class(**group_spec[DISK_SPEC][cloud])
-          disk_spec.ApplyFlags(FLAGS)
-          # disk_spec.disk_type may contain legacy values that were
-          # copied from FLAGS.scratch_disk_type into
-          # FLAGS.data_disk_type at the beginning of the run. We
-          # translate them here, rather than earlier, because here is
-          # where we know what cloud we're using and therefore we're
-          # able to pick the right translation table.
-          disk_spec.disk_type = disk.WarnAndTranslateDiskTypes(
-              disk_spec.disk_type, cloud)
-        else:
-          disk_spec = None
-
-      except TypeError as e:
-        # This is what we get if one of the kwargs passed into a spec's
-        # __init__ method was unexpected.
-        raise ValueError(
-            'Config contained an unexpected parameter. Error message:\n%s' % e)
-
-      # Create the remaining VMs using the specs we created earlier.
-      for _ in xrange(vm_count - len(vms)):
-        vm_spec.ApplyFlags(FLAGS)
-        vm = self._CreateVirtualMachine(vm_spec, os_type, cloud)
-        if disk_spec:
-          vm.disk_specs = [copy.copy(disk_spec) for _ in xrange(disk_count)]
-          # In the event that we need to create multiple disks from the same
-          # DiskSpec, we need to ensure that they have different mount points.
-          if (disk_count > 1 and disk_spec.mount_point):
-            for i, spec in enumerate(vm.disk_specs):
-              spec.mount_point += str(i)
-        vms.append(vm)
+          jujuvm.units.extend(vms)
+          if jujuvm and jujuvm not in self.vms:
+            self.vms.extend([jujuvm])
+            self.vm_groups['%s_juju_controller' % group_spec.cloud] = [jujuvm]
 
       self.vm_groups[group_name] = vms
       self.vms.extend(vms)
 
+  def ConstructSparkService(self):
+    if self.config.spark_service is None:
+      return
+
+    providers.LoadProvider(self.config.spark_service.cloud)
+    spark_service_spec = self.config.spark_service
+    service_type = spark_service_spec.service_type
+    spark_service_class = spark_service.GetSparkServiceClass(
+        spark_service_spec.cloud, service_type)
+    self.spark_service = spark_service_class(spark_service_spec)
+
   def Prepare(self):
+    targets = [(vm.PrepareBackgroundWorkload, (), {}) for vm in self.vms]
+    vm_util.RunParallelThreads(targets, len(targets))
+
+  def Provision(self):
     """Prepares the VMs and networks necessary for the benchmark to run."""
-    vm_util.RunThreaded(lambda net: net.Create(), self.networks.values())
+    # Sort networks into a guaranteed order of creation based on dict key.
+    # There is a finite limit on the number of threads that are created to
+    # provision networks. Until support is added to provision resources in an
+    # order based on dependencies, this key ordering can be used to avoid
+    # deadlock by placing dependent networks later and their dependencies
+    # earlier. As an example, AWS stores both per-region and per-zone objects
+    # in this dict, and each per-zone object depends on a corresponding
+    # per-region object, so the per-region objects are given keys that come
+    # first when sorted.
+    networks = [self.networks[key] for key in sorted(self.networks.iterkeys())]
+    vm_util.RunThreaded(lambda net: net.Create(), networks)
 
     if self.vms:
       vm_util.RunThreaded(self.PrepareVm, self.vms)
-      if FLAGS.os_type != WINDOWS:
-        vm_util.GenerateSSHConfig(self)
+      sshable_vms = [vm for vm in self.vms if vm.OS_TYPE != os_types.WINDOWS]
+      sshable_vm_groups = {}
+      for group_name, group_vms in self.vm_groups.iteritems():
+        sshable_vm_groups[group_name] = [vm for vm in group_vms
+                                         if vm.OS_TYPE != os_types.WINDOWS]
+      vm_util.GenerateSSHConfig(sshable_vms, sshable_vm_groups)
+    if self.spark_service:
+      self.spark_service.Create()
 
   def Delete(self):
     if self.deleted:
       return
+
+    if self.spark_service:
+      self.spark_service.Delete()
 
     if self.vms:
       try:
@@ -259,6 +299,14 @@ class BenchmarkSpec(object):
         logging.exception('Got an exception deleting networks. '
                           'Attempting to continue tearing down.')
     self.deleted = True
+
+  def StartBackgroundWorkload(self):
+    targets = [(vm.StartBackgroundWorkload, (), {}) for vm in self.vms]
+    vm_util.RunParallelThreads(targets, len(targets))
+
+  def StopBackgroundWorkload(self):
+    targets = [(vm.StopBackgroundWorkload, (), {}) for vm in self.vms]
+    vm_util.RunParallelThreads(targets, len(targets))
 
   def _CreateVirtualMachine(self, vm_spec, os_type, cloud):
     """Create a vm in zone.
@@ -291,13 +339,13 @@ class BenchmarkSpec(object):
         vm: The BaseVirtualMachine object representing the VM.
     """
     vm.Create()
+
     logging.info('VM: %s', vm.ip_address)
     logging.info('Waiting for boot completion.')
-    for port in vm.remote_access_ports:
-      vm.AllowPort(port)
+    vm.AllowRemoteAccessPorts()
+    vm.WaitForBootCompletion()
     vm.AddMetadata(benchmark=self.name, perfkit_uuid=self.uuid,
                    benchmark_uid=self.uid)
-    vm.WaitForBootCompletion()
     vm.OnStartup()
     if any((spec.disk_type == disk.LOCAL for spec in vm.disk_specs)):
       vm.SetupLocalDisks()
@@ -321,18 +369,22 @@ class BenchmarkSpec(object):
 
   def PickleSpec(self):
     """Pickles the spec so that it can be unpickled on a subsequent run."""
-    # FlagValues objects can't be pickled without getting an error.
-    flags, self._flags = self._flags, None
+    # Remove the config. It cannot be pickled because of an issue with how
+    # gflags dynamically defines a Checker function for flags with a lower_bound
+    # or upper_bound.
+    config, self.config = self.config, None
     with open(self.file_name, 'wb') as pickle_file:
       pickle.dump(self, pickle_file, 2)
-    self._flags = flags
+    self.config = config
 
   @classmethod
-  def GetSpecFromFile(cls, name):
+  def GetSpecFromFile(cls, name, config):
     """Unpickles the spec and returns it.
 
     Args:
       name: The name of the benchmark (and the name of the pickled file).
+      config: BenchmarkConfigSpec. The benchmark configuration to use while
+          running the current stage.
 
     Returns:
       A BenchmarkSpec object.
@@ -344,6 +396,7 @@ class BenchmarkSpec(object):
     except Exception as e:  # pylint: disable=broad-except
       logging.error('Unable to unpickle spec file for benchmark %s.', name)
       raise e
+    spec.config = config
     # Always let the spec be deleted after being unpickled so that
     # it's possible to run cleanup even if cleanup has already run.
     spec.deleted = False

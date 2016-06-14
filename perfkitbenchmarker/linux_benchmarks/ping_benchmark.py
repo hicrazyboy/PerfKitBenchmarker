@@ -31,11 +31,17 @@ ping:
       or internal IP address
   vm_groups:
     vm_1:
+<<<<<<< HEAD
       vm_spec: *default_single_core
       vm_count: 1
     vm_2:
       vm_spec: *default_single_core
       vm_count: 1
+=======
+      vm_spec: *default_single_core
+    vm_2:
+      vm_spec: *default_single_core
+>>>>>>> ee0276d4a108ce7867e16fa3357cc990d9d6a103
 """
 
 
@@ -54,12 +60,15 @@ def GetConfig(user_config):
 
 def Prepare(benchmark_spec):  # pylint: disable=unused-argument
   """Install ping on the target vm.
-
+  Checks that there are exactly two vms specified.
   Args:
     benchmark_spec: The benchmark specification. Contains all data that is
         required to run the benchmark.
   """
-  pass
+  if len(benchmark_spec.vms) != 2:
+    raise ValueError(
+        'Ping benchmark requires exactly two machines, found {0}'
+        .format(len(benchmark_spec.vms)))
 
 
 def Run(benchmark_spec):
@@ -72,6 +81,7 @@ def Run(benchmark_spec):
   Returns:
     A list of sample.Sample objects.
   """
+<<<<<<< HEAD
   results = []
   vms = benchmark_spec.vms
   for vm_idx1 in range(0, len(vms)):
@@ -100,6 +110,44 @@ def Run(benchmark_spec):
       for i, metric in enumerate(METRICS[:-1]):
         results.append(sample.Sample(metric, float(stats[i]), 'ms', metadata))
       results.append(sample.Sample(METRICS[-1], float(stats[-1]), '%', metadata))
+=======
+  vms = benchmark_spec.vms
+  results = []
+  for sending_vm, receiving_vm in vms, reversed(vms):
+    results = results + _RunPing(sending_vm,
+                                 receiving_vm,
+                                 receiving_vm.internal_ip,
+                                 'internal')
+  return results
+
+
+def _RunPing(sending_vm, receiving_vm, receiving_ip, ip_type):
+  """Run ping using 'sending_vm' to connect to 'receiving_ip'.
+
+  Args:
+    sending_vm: The VM issuing the ping request.
+    receiving_vm: The VM receiving the ping.  Needed for metadata.
+    receiving_ip: The IP address to be pinged.
+    ip_type: The type of 'receiving_ip' (either 'internal' or 'external')
+  Returns:
+    A list of samples, with one sample for each metric.
+  """
+  if not sending_vm.IsReachable(receiving_vm):
+    logging.warn('%s is not reachable from %s', receiving_vm, sending_vm)
+    return []
+
+  logging.info('Ping results:')
+  ping_cmd = 'ping -c 100 %s' % receiving_ip
+  stdout, _ = sending_vm.RemoteCommand(ping_cmd, should_log=True)
+  stats = re.findall('([0-9]*\\.[0-9]*)', stdout.splitlines()[-1])
+  assert len(stats) == len(METRICS), stats
+  results = []
+  metadata = {'ip_type': ip_type,
+              'receiving_zone': receiving_vm.zone,
+              'sending_zone': sending_vm.zone}
+  for i, metric in enumerate(METRICS):
+    results.append(sample.Sample(metric, float(stats[i]), 'ms', metadata))
+>>>>>>> ee0276d4a108ce7867e16fa3357cc990d9d6a103
   return results
 
 

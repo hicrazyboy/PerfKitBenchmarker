@@ -31,6 +31,7 @@ from perfkitbenchmarker import flags
 from perfkitbenchmarker import resource
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.configs import option_decoders
+from perfkitbenchmarker.configs import spec
 
 FLAGS = flags.FLAGS
 DEFAULT_USERNAME = 'perfkit'
@@ -49,7 +50,7 @@ def GetVmClass(cloud, os_type):
   return _VM_REGISTRY.get((cloud, os_type))
 
 
-class AutoRegisterVmSpecMeta(type):
+class AutoRegisterVmSpecMeta(spec.BaseSpecMetaClass):
   """Metaclass which allows VmSpecs to automatically be registered."""
 
   def __init__(cls, name, bases, dct):
@@ -57,9 +58,6 @@ class AutoRegisterVmSpecMeta(type):
     if cls.CLOUD in _VM_SPEC_REGISTRY:
       raise Exception('BaseVmSpec subclasses must have a CLOUD attribute.')
     _VM_SPEC_REGISTRY[cls.CLOUD] = cls
-    cls._init_decoders_lock = threading.Lock()
-    cls._decoders = {}
-    cls._required_options = set()
 
 
 class AutoRegisterVmMeta(abc.ABCMeta):
@@ -78,7 +76,7 @@ class AutoRegisterVmMeta(abc.ABCMeta):
     super(AutoRegisterVmMeta, cls).__init__(name, bases, dct)
 
 
-class BaseVmSpec(object):
+class BaseVmSpec(spec.BaseSpec):
   """Storing various data about a single vm.
 
   Attributes:
@@ -87,113 +85,80 @@ class BaseVmSpec(object):
     image: The disk image to boot from.
     install_packages: If false, no packages will be installed. This is
         useful if benchmark dependencies have already been installed.
+    background_cpu_threads: The number of threads of background CPU usage
+        while running the benchmark.
+    background_network_mbits_per_sec: The number of megabits per second of
+        background network traffic during the benchmark.
+    background_network_ip_type: The IP address type (INTERNAL or
+        EXTERNAL) to use for generating background network workload.
   """
 
   __metaclass__ = AutoRegisterVmSpecMeta
   CLOUD = None
 
-  # Each subclass has its own copy of the following three variables. They are
-  # initialized by AutoRegisterVmSpecMeta.__init__ and later populated by
-  # _InitDecoders when the first instance of the subclass is created.
-  _init_decoders_lock = None  # threading.Lock that protects the next two vars.
-  _decoders = None  # dict mapping config option name to ConfigOptionDecoder.
-  _required_options = None  # set of strings. Required config options.
+  @classmethod
+  def _ApplyFlags(cls, config_values, flag_values):
+    """Overrides config values with flag values.
 
-  def __init__(self, **kwargs):
-    """Initializes a BaseVmSpec.
-
-    Translates keyword arguments via the class's decoders and assigns the
-    corresponding instance attribute. Derived classes can register decoders
-    for additional attributes by overriding _GetOptionDecoderConstructions.
+    Can be overridden by derived classes to add support for specific flags.
 
     Args:
-      **kwargs: Dict mapping config option names to provided values.
-
-    Raises:
-      errors.Config.MissingOption: If a config option is required, but a value
-          was not provided in kwargs.
-      errors.Config.UnrecognizedOption: If an unrecognized config option is
-          provided with a value in kwargs.
-    """
-    if not self._decoders:
-      self._InitDecoders()
-    # TODO(skschneider): Remove ApplyFlags from the benchmark spec. Call it
-    # here to modify kwargs prior to these decoder verifications.
-    provided_options = frozenset(k for k, v in kwargs.iteritems()
-                                 if v is not None)
-    missing_options = self._required_options.difference(provided_options)
-    if missing_options:
-      raise errors.Config.MissingOption(
-          'Required options were missing from a {0} config: {1}.'.format(
-              self._GetComponentDescription(),
-              ', '.join(sorted(missing_options))))
-    unrecognized_options = frozenset(provided_options).difference(
-        self._decoders)
-    if unrecognized_options:
-      raise errors.Config.UnrecognizedOption(
-          'Unrecognized options were found in a {0} config: {1}.'.format(
-              self._GetComponentDescription(),
-              ', '.join(sorted(unrecognized_options))))
-    for option, decoder in self._decoders.iteritems():
-      if option in provided_options:
-        value = decoder.Decode(kwargs[option])
-      else:
-        value = decoder.default
-      setattr(self, option, value)
-
-  @classmethod
-  def _GetComponentDescription(cls):
-    """Describes the type of component that this spec configures.
+      config_values: dict mapping config option names to provided values. Is
+          modified by this function.
+      flag_values: flags.FlagValues. Runtime flags that may override the
+          provided config values.
 
     Returns:
-      string. Description of the type of component that this spec configures.
+      dict mapping config option names to values derived from the config
+      values or flag values.
     """
-    return 'VM' if cls.CLOUD is None else cls.CLOUD + ' VM'
+    super(BaseVmSpec, cls)._ApplyFlags(config_values, flag_values)
+    if flag_values['image'].present:
+      config_values['image'] = flag_values.image
+    if flag_values['install_packages'].present:
+      config_values['install_packages'] = flag_values.install_packages
+    if flag_values['machine_type'].present:
+      config_values['machine_type'] = flag_values.machine_type
+    if flag_values['background_cpu_threads'].present:
+      config_values['background_cpu_threads'] = (
+          flag_values.background_cpu_threads)
+    if flag_values['background_network_mbits_per_sec'].present:
+      config_values['background_network_mbits_per_sec'] = (
+          flag_values.background_network_mbits_per_sec)
+    if flag_values['background_network_ip_type'].present:
+      config_values['background_network_ip_type'] = (
+          flag_values.background_network_ip_type)
 
   @classmethod
   def _GetOptionDecoderConstructions(cls):
     """Gets decoder classes and constructor args for each configurable option.
 
-    Can be overridden to add options or impose additional requirements on
-    existing options.
+    Can be overridden by derived classes to add options or impose additional
+    requirements on existing options.
 
     Returns:
       dict. Maps option name string to a (ConfigOptionDecoder class, dict) pair.
           The pair specifies a decoder class and its __init__() keyword
           arguments to construct in order to decode the named option.
     """
-    return {
-        'image': (option_decoders.StringDecoder, {'default': None}),
+    result = super(BaseVmSpec, cls)._GetOptionDecoderConstructions()
+    result.update({
+        'image': (option_decoders.StringDecoder, {'none_ok': True,
+                                                  'default': None}),
         'install_packages': (option_decoders.BooleanDecoder, {'default': True}),
-        'machine_type': (option_decoders.StringDecoder, {'default': None}),
-        'zone': (option_decoders.StringDecoder, {'default': None})}
-
-  @classmethod
-  def _InitDecoders(cls):
-    """Creates a ConfigOptionDecoder for each config option.
-
-    Populates cls._decoders and cls._required_options.
-    """
-    with cls._init_decoders_lock:
-      if not cls._decoders:
-        component = cls._GetComponentDescription()
-        decoder_constructions = cls._GetOptionDecoderConstructions()
-        for option, decoder_construction in decoder_constructions.iteritems():
-          decoder_class, init_args = decoder_construction
-          decoder = decoder_class(component, option, **init_args)
-          cls._decoders[option] = decoder
-          if decoder.required:
-            cls._required_options.add(option)
-
-  def ApplyFlags(self, flags):
-    """Applies flags to the VmSpec."""
-    if flags.zones:
-      self.zone = flags.zones.pop(0)
-      flags.zones.append(self.zone)
-    self.machine_type = flags.machine_type or self.machine_type
-    self.image = flags.image or self.image
-    if flags.install_packages is not None:
-      self.install_packages = flags.install_packages
+        'machine_type': (option_decoders.StringDecoder, {'none_ok': True,
+                                                         'default': None}),
+        'zone': (option_decoders.StringDecoder, {'none_ok': True,
+                                                 'default': None}),
+        'background_network_mbits_per_sec': (option_decoders.IntDecoder, {
+            'none_ok': True, 'default': None}),
+        'background_network_ip_type': (option_decoders.EnumDecoder, {
+            'default': vm_util.IpAddressSubset.EXTERNAL,
+            'valid_values': [vm_util.IpAddressSubset.EXTERNAL,
+                             vm_util.IpAddressSubset.INTERNAL]}),
+        'background_cpu_threads': (option_decoders.IntDecoder, {
+            'none_ok': True, 'default': None})})
+    return result
 
 
 class BaseVirtualMachine(resource.BaseResource):
@@ -206,7 +171,7 @@ class BaseVirtualMachine(resource.BaseResource):
   Attributes:
     image: The disk image used to boot.
     internal_ip: Internal IP address.
-    ip: Public (external) IP address.
+    ip_address: Public (external) IP address.
     machine_type: The provider-specific instance type (e.g. n1-standard-8).
     project: The provider-specific project associated with the VM (e.g.
       artisanal-lightbulb-883).
@@ -220,6 +185,12 @@ class BaseVirtualMachine(resource.BaseResource):
     scratch_disks: list of BaseDisk objects. Scratch disks attached to the VM.
     max_local_disks: The number of local disks on the VM that can be used as
       scratch disks or that can be striped together.
+    background_cpu_threads: The number of threads of background CPU usage
+      while running the benchmark.
+    background_network_mbits_per_sec: Number of mbits/sec of background network
+      usage while running the benchmark.
+    background_network_ip_type: Type of IP address to use for generating
+      background network workload
   """
 
   __metaclass__ = AutoRegisterVmMeta
@@ -255,6 +226,10 @@ class BaseVirtualMachine(resource.BaseResource):
     self.max_local_disks = 0
     self.local_disk_counter = 0
     self.remote_disk_counter = 0
+    self.background_cpu_threads = vm_spec.background_cpu_threads
+    self.background_network_mbits_per_sec = (
+        vm_spec.background_network_mbits_per_sec)
+    self.background_network_ip_type = vm_spec.background_network_ip_type
 
     self.network = None
     self.firewall = None
@@ -308,6 +283,11 @@ class BaseVirtualMachine(resource.BaseResource):
     """Opens the port on the firewall corresponding to the VM if one exists."""
     if self.firewall:
       self.firewall.AllowPort(self, port)
+
+  def AllowRemoteAccessPorts(self):
+    """Allow all ports in self.remote_access_ports."""
+    for port in self.remote_access_ports:
+      self.AllowPort(port)
 
   def AddMetadata(self, **kwargs):
     """Add key/value metadata to the instance.
@@ -465,15 +445,16 @@ class BaseOsMixin(object):
     """
     self.RemoteCopy(source_path, remote_path)
 
-  def PullFile(self, source_path, remote_path=''):
-    """Copies a file or a directory from the VM.
+  def PullFile(self, local_path, remote_path):
+    """Copies a file or a directory from the VM to the local machine.
 
     Args:
-      source_path: The location of the file or directory on the REMOTE machine.
-      remote_path: The destination of the file on the LOCAL machine, default
-          is the home directory.
+      local_path: string. The destination path of the file or directory on the
+          local machine.
+      remote_path: string. The source path of the file or directory on the
+          remote machine.
     """
-    self.RemoteCopy(source_path, remote_path, copy_to=False)
+    self.RemoteCopy(local_path, remote_path, copy_to=False)
 
   def PushDataFile(self, data_file, remote_path=''):
     """Upload a file in perfkitbenchmarker.data directory to the VM.
@@ -612,3 +593,18 @@ class BaseOsMixin(object):
   def _TestReachable(self, ip):
     """Returns True if the VM can reach the ip address and False otherwise."""
     raise NotImplementedError()
+
+  def StartBackgroundWorkload(self):
+    """Start the background workload."""
+    if self.background_cpu_threads or self.background_network_mbits_per_sec:
+      raise NotImplementedError()
+
+  def StopBackgroundWorkload(self):
+    """Stop the background workoad."""
+    if self.background_cpu_threads or self.background_network_mbits_per_sec:
+      raise NotImplementedError()
+
+  def PrepareBackgroundWorkload(self):
+    """Prepare for the background workload."""
+    if self.background_cpu_threads or self.background_network_mbits_per_sec:
+      raise NotImplementedError()

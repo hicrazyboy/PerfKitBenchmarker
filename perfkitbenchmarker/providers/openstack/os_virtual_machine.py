@@ -17,12 +17,15 @@ import threading
 import time
 
 from perfkitbenchmarker import virtual_machine, linux_virtual_machine
+from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import vm_util
+from perfkitbenchmarker import providers
 from perfkitbenchmarker.providers.openstack import os_disk
 from perfkitbenchmarker.providers.openstack import os_network
 from perfkitbenchmarker.providers.openstack import utils as os_utils
 
+RHEL_IMAGE = 'rhel-7.2'
 UBUNTU_IMAGE = 'ubuntu-14.04'
 NONE = 'None'
 
@@ -32,8 +35,7 @@ FLAGS = flags.FLAGS
 class OpenStackVirtualMachine(virtual_machine.BaseVirtualMachine):
     """Object representing an OpenStack Virtual Machine"""
 
-    CLOUD = 'OpenStack'
-    DEFAULT_USERNAME = 'ubuntu'
+    CLOUD = providers.OPENSTACK
     # Subclasses should override the default image.
     DEFAULT_IMAGE = None
     _floating_ip_lock = threading.Lock()
@@ -46,47 +48,58 @@ class OpenStackVirtualMachine(virtual_machine.BaseVirtualMachine):
         """
         super(OpenStackVirtualMachine, self).__init__(vm_spec)
         self.firewall = os_network.OpenStackFirewall.GetFirewall()
+        self.firewall.AllowICMP(self)
+        self.firewall.AllowPort(self, 1, os_network.MAX_PORT)
         self.name = 'perfkit_vm_%d_%s' % (self.instance_number, FLAGS.run_uri)
         self.key_name = 'perfkit_key_%d_%s' % (self.instance_number,
                                                FLAGS.run_uri)
         self.client = os_utils.NovaClient()
+        # FIXME(meteorfox): Remove --openstack_public_network and
+        # --openstack_private_network once depreciation time has expired
+        self.network_name = (FLAGS.openstack_network or
+                             FLAGS.openstack_private_network)
+        self.floating_ip_pool_name = (FLAGS.openstack_floating_ip_pool or
+                                      FLAGS.openstack_public_network)
         self.public_network = os_network.OpenStackPublicNetwork(
-            FLAGS.openstack_public_network
-        )
+            FLAGS.openstack_floating_ip_pool)
         self.id = None
         self.pk = None
-        self.user_name = self.DEFAULT_USERNAME
+        self.user_name = FLAGS.openstack_image_username
         self.boot_wait_time = None
         self.image = self.image or self.DEFAULT_IMAGE
+        self.public_net = None
+        self.private_net = None
+        self.floating_ip = None
 
     def _Create(self):
         image = self.client.images.findall(name=self.image)[0]
         flavor = self.client.flavors.findall(name=self.machine_type)[0]
+        self.private_net = self.client.networks.find(label=self.network_name)
+        if self.floating_ip_pool_name:
+            self.public_net = self.client.networks.find(
+                label=self.floating_ip_pool_name)
 
-        network = self.client.networks.find(
-            label=FLAGS.openstack_private_network)
-        nics = [{'net-id': network.id}]
+        if not self.private_net:
+            if self.public_net:
+                raise errors.Error(
+                    'Cannot associate floating-ip address from pool %s without '
+                    'an internally routable network. Make sure '
+                    '--openstack_network flag is set.')
+            else:
+                raise errors.Error(
+                    'Cannot build instance without a network. Make sure to set '
+                    'either just --openstack_network or both '
+                    '--openstack_network and --openstack_floating_ip_pool '
+                    'flags.')
+
+        nics = [{'net-id': self.private_net.id}]
+
         image_id = image.id
         boot_from_vol = []
-        scheduler_hints = None
-
-        if FLAGS.openstack_scheduler_policy != NONE:
-            group_name = 'perfkit_%s' % FLAGS.run_uri
-            try:
-                group = self.client.server_groups.findall(name=group_name)[0]
-            except IndexError:
-                group = self.client.server_groups.create(
-                    policies=[FLAGS.openstack_scheduler_policy],
-                    name=group_name)
-            scheduler_hints = {'group': group.id}
+        scheduler_hints = self._GetSchedulerHints()
 
         if FLAGS.openstack_boot_from_volume:
-
-            if FLAGS.openstack_volume_size:
-                volume_size = FLAGS.openstack_volume_size
-            else:
-                volume_size = flavor.disk
-
+            volume_size = FLAGS.openstack_volume_size or flavor.disk
             image_id = None
             boot_from_vol = [{'boot_index': 0,
                               'uuid': image.id,
@@ -108,6 +121,19 @@ class OpenStackVirtualMachine(virtual_machine.BaseVirtualMachine):
             config_drive=FLAGS.openstack_config_drive)
         self.id = vm.id
 
+    def _GetSchedulerHints(self):
+        scheduler_hints = None
+        if FLAGS.openstack_scheduler_policy != NONE:
+            group_name = 'perfkit_%s' % FLAGS.run_uri
+            try:
+                group = self.client.server_groups.findall(name=group_name)[0]
+            except IndexError:
+                group = self.client.server_groups.create(
+                    policies=[FLAGS.openstack_scheduler_policy],
+                    name=group_name)
+            scheduler_hints = {'group': group.id}
+        return scheduler_hints
+
     @vm_util.Retry(max_retries=4, poll_interval=2)
     def _PostCreate(self):
         status = 'BUILD'
@@ -116,41 +142,42 @@ class OpenStackVirtualMachine(virtual_machine.BaseVirtualMachine):
             time.sleep(5)
             instance = self.client.servers.get(self.id)
             status = instance.status
+        # Unlikely to be false, previously checked to be true in self._Create()
+        assert self.private_net is not None, '--openstack_network must be set.'
+        self.internal_ip = instance.networks[self.network_name][0]
+        self.ip_address = self.internal_ip
+        if self.public_net:
+            self.floating_ip = self._AllocateFloatingIP(instance)
+            self.ip_address = self.floating_ip.ip
 
+    def _AllocateFloatingIP(self, instance):
         with self._floating_ip_lock:
-            self.floating_ip = self.public_network.get_or_create()
-            instance.add_floating_ip(self.floating_ip)
-            logging.info('floating-ip associated: {}'.format(
-                self.floating_ip.ip))
-
-        while not self.public_network.is_attached(self.floating_ip):
+            floating_ip = self.public_network.get_or_create()
+            instance.add_floating_ip(floating_ip)
+            logging.info(
+                'floating-ip associated: {}'.format(floating_ip.ip))
+        while not self.public_network.is_attached(floating_ip):
             time.sleep(1)
+        return floating_ip
 
-        self.ip_address = self.floating_ip.ip
-        self.internal_ip = instance.networks[
-            FLAGS.openstack_private_network][0]
-
-    @os_utils.retry_authorization(max_retries=4)
     def _Delete(self):
+        from novaclient.exceptions import NotFound
         try:
             self.client.servers.delete(self.id)
-            time.sleep(5)
-        except os_utils.NotFound:
-            logging.info('Instance already deleted')
+            self._WaitForDeleteCompletion()
+        except NotFound:
+            logging.info('Instance not found, may have been already deleted')
 
-        self.public_network.release(self.floating_ip)
+        if self.floating_ip:
+            self.public_network.release(self.floating_ip)
 
-    @os_utils.retry_authorization(max_retries=4)
     def _Exists(self):
+        from novaclient.exceptions import NotFound
         try:
-            if self.client.servers.findall(name=self.name):
-                return True
-            else:
-                return False
-        except os_utils.NotFound:
+            return self.client.servers.get(self.id) is not None
+        except NotFound:
             return False
 
-    @vm_util.Retry(log_errors=False, poll_interval=1)
     def WaitForBootCompletion(self):
         # Do one longer sleep, then check at shorter intervals.
         if self.boot_wait_time is None:
@@ -163,19 +190,29 @@ class OpenStackVirtualMachine(virtual_machine.BaseVirtualMachine):
         if self.hostname is None:
             self.hostname = resp[:-1]
 
+    @vm_util.Retry(poll_interval=5, max_retries=-1, timeout=300,
+                   log_errors=False,
+                   retryable_exceptions=(
+                       errors.Resource.RetryableDeletionError,))
+    def _WaitForDeleteCompletion(self):
+        instance = self.client.servers.get(self.id)
+        if instance and instance.status == 'ACTIVE':
+            raise errors.Resource.RetryableDeletionError(
+                'VM: %s has not been deleted. Retrying to check status.'
+                % self.name)
+
     def CreateScratchDisk(self, disk_spec):
-        name = '%s-scratch-%s' % (self.name, len(self.scratch_disks))
-        scratch_disk = os_disk.OpenStackDisk(disk_spec, name, self.zone)
-        self.scratch_disks.append(scratch_disk)
+        disks_names = ('%s-data-%d-%d'
+                       % (self.name, len(self.scratch_disks), i)
+                       for i in range(disk_spec.num_striped_disks))
+        disks = [os_disk.OpenStackDisk(disk_spec, name, self.zone)
+                 for name in disks_names]
 
-        scratch_disk.Create()
-        scratch_disk.Attach(self)
-
-        self.FormatDisk(scratch_disk.GetDevicePath())
-        self.MountDisk(scratch_disk.GetDevicePath(), disk_spec.mount_point)
+        self._CreateScratchDiskFromDisks(disk_spec, disks)
 
     def _CreateDependencies(self):
         self.ImportKeyfile()
+        self.AllowRemoteAccessPorts()
 
     def _DeleteDependencies(self):
         self.DeleteKeyfile()
@@ -191,14 +228,19 @@ class OpenStackVirtualMachine(virtual_machine.BaseVirtualMachine):
             pk = self.client.keypairs.findall(name=self.key_name)[0]
         self.pk = pk
 
-    @os_utils.retry_authorization(max_retries=4)
     def DeleteKeyfile(self):
+        from novaclient.exceptions import NotFound
         try:
             self.client.keypairs.delete(self.pk)
-        except os_utils.NotFound:
+        except NotFound:
             logging.info("Deleting key doesn't exists")
 
 
 class DebianBasedOpenStackVirtualMachine(OpenStackVirtualMachine,
                                          linux_virtual_machine.DebianMixin):
     DEFAULT_IMAGE = UBUNTU_IMAGE
+
+
+class RhelBasedOpenStackVirtualMachine(OpenStackVirtualMachine,
+                                       linux_virtual_machine.RhelMixin):
+    DEFAULT_IMAGE = RHEL_IMAGE

@@ -20,8 +20,7 @@ with an HBase-compatible API.
 Compared to hbase_ycsb, this benchmark:
   * Modifies hbase-site.xml to work with Cloud Bigtable.
   * Adds the Bigtable client JAR.
-  * Adds alpn-boot-7.0.0.v20140317.jar to the bootclasspath, required to
-    operate.
+  * Adds netty-tcnative-boringssl, used for communication with Bigtable.
 
 This benchmark requires a Cloud Bigtable cluster to be provisioned before
 running.
@@ -33,6 +32,7 @@ import logging
 import os
 import pipes
 import posixpath
+import re
 import subprocess
 
 from perfkitbenchmarker import configs
@@ -43,8 +43,13 @@ from perfkitbenchmarker.linux_benchmarks import hbase_ycsb_benchmark \
     as hbase_ycsb
 from perfkitbenchmarker.linux_packages import hbase
 from perfkitbenchmarker.linux_packages import ycsb
+from perfkitbenchmarker.providers.gcp import gcp_bigtable
 
 FLAGS = flags.FLAGS
+
+HBASE_VERSION = re.match(r'(\d+\.\d+)\.?\d*', hbase.HBASE_VERSION).group(1)
+
+BIGTABLE_CLIENT_VERSION = '0.2.4'
 
 flags.DEFINE_string('google_bigtable_endpoint', 'bigtable.googleapis.com',
                     'Google API endpoint for Cloud Bigtable.')
@@ -57,15 +62,12 @@ flags.DEFINE_string('google_bigtable_zone_name', 'us-central1-b',
 flags.DEFINE_string('google_bigtable_cluster_name', None,
                     'Bigtable cluster name.')
 flags.DEFINE_string(
-    'google_bigtable_alpn_jar_url',
-    'http://central.maven.org/maven2/org/mortbay/jetty/alpn/'
-    'alpn-boot/7.1.3.v20150130/alpn-boot-7.1.3.v20150130.jar',
-    'URL for the ALPN boot JAR, required for HTTP2')
-flags.DEFINE_string(
     'google_bigtable_hbase_jar_url',
     'https://oss.sonatype.org/service/local/repositories/releases/content/'
-    'com/google/cloud/bigtable/bigtable-hbase-1.0/'
-    '0.2.1/bigtable-hbase-1.0-0.2.1.jar',
+    'com/google/cloud/bigtable/bigtable-hbase-{0}/'
+    '{1}/bigtable-hbase-{0}-{1}.jar'.format(
+        HBASE_VERSION,
+        BIGTABLE_CLIENT_VERSION),
     'URL for the Bigtable-HBase client JAR.')
 
 BENCHMARK_NAME = 'cloud_bigtable_ycsb'
@@ -78,8 +80,16 @@ cloud_bigtable_ycsb:
     default:
       vm_spec: *default_single_core
       vm_count: null
-"""
+  flags:
+    gcloud_scopes: >
+      https://www.googleapis.com/auth/bigtable.admin
+      https://www.googleapis.com/auth/bigtable.data"""
 
+TCNATIVE_BORINGSSL_URL = (
+    'http://search.maven.org/remotecontent?filepath='
+    'io/netty/netty-tcnative-boringssl-static/'
+    '1.1.33.Fork13/'
+    'netty-tcnative-boringssl-static-1.1.33.Fork13-linux-x86_64.jar')
 HBASE_SITE = 'cloudbigtable/hbase-site.xml.j2'
 HBASE_CONF_FILES = [HBASE_SITE]
 YCSB_HBASE_LIB = posixpath.join(ycsb.YCSB_DIR, 'hbase-binding', 'lib')
@@ -91,6 +101,9 @@ REQUIRED_SCOPES = (
 
 # TODO(connormccoy): Make table parameters configurable.
 COLUMN_FAMILY = 'cf'
+
+# Only used when we need to create the cluster.
+CLUSTER_SIZE = 3
 
 
 def GetConfig(user_config):
@@ -114,21 +127,13 @@ def CheckPrerequisites():
       raise ValueError('Scope {0} required.'.format(scope))
 
   # TODO: extract from gcloud config if available.
-  if not FLAGS.google_bigtable_cluster_name:
-    raise ValueError('Missing --google_bigtable_cluster_name')
-  if not FLAGS.google_bigtable_zone_name:
-    raise ValueError('Missing --google_bigtable_zone_name')
-  cluster = _GetClusterDescription(FLAGS.project or _GetDefaultProject(),
-                                   FLAGS.google_bigtable_zone_name,
-                                   FLAGS.google_bigtable_cluster_name)
-  logging.info('Found cluster: %s', cluster)
-
-
-def _GetALPNLocalPath():
-  bn = os.path.basename(FLAGS.google_bigtable_alpn_jar_url)
-  if not bn.endswith('.jar'):
-    bn = 'alpn.jar'
-  return posixpath.join(vm_util.VM_TMP_DIR, bn)
+  if FLAGS.google_bigtable_cluster_name:
+    cluster = _GetClusterDescription(FLAGS.project or _GetDefaultProject(),
+                                     FLAGS.google_bigtable_zone_name,
+                                     FLAGS.google_bigtable_cluster_name)
+    logging.info('Found cluster: %s', cluster)
+  else:
+    logging.info('No cluster; will create in Prepare.')
 
 
 def _GetClusterDescription(project, zone, cluster_name):
@@ -154,14 +159,12 @@ def _GetClusterDescription(project, zone, cluster_name):
     raise IOError('Command "{0}" failed:\nSTDOUT:\n{1}\nSTDERR:\n{2}'.format(
         ' '.join(cmd), stdout, stderr))
   result = json.loads(stdout)
-  clusters = {cluster['name']: cluster for cluster in result['clusters']}
-  expected_cluster_name = 'projects/{0}/zones/{1}/clusters/{2}'.format(
-      project, zone, cluster_name)
+  clusters = {cluster['clusterId']: cluster for cluster in result}
   try:
-    return clusters[expected_cluster_name]
+    return clusters[cluster_name]
   except KeyError:
     raise KeyError('Cluster {0} not found in {1}'.format(
-        expected_cluster_name, list(clusters)))
+        cluster_name, list(clusters)))
 
 
 def _GetTableName():
@@ -186,28 +189,27 @@ def _Install(vm):
   """Install YCSB and HBase on 'vm'."""
   vm.Install('hbase')
   vm.Install('ycsb')
+  vm.Install('curl')
 
+  cluster_name = (FLAGS.google_bigtable_cluster_name or
+                  'pkb-bigtable-{0}'.format(FLAGS.run_uri))
   hbase_lib = posixpath.join(hbase.HBASE_DIR, 'lib')
-  for url in [FLAGS.google_bigtable_hbase_jar_url]:
+  for url in [FLAGS.google_bigtable_hbase_jar_url, TCNATIVE_BORINGSSL_URL]:
     jar_name = os.path.basename(url)
     jar_path = posixpath.join(YCSB_HBASE_LIB, jar_name)
     vm.RemoteCommand('curl -Lo {0} {1}'.format(jar_path, url))
     vm.RemoteCommand('cp {0} {1}'.format(jar_path, hbase_lib))
 
-  vm.RemoteCommand('curl -Lo {0} {1}'.format(
-      _GetALPNLocalPath(),
-      FLAGS.google_bigtable_alpn_jar_url))
-  vm.RemoteCommand(('echo "export JAVA_HOME=/usr\n'
-                    'export HBASE_OPTS=-Xbootclasspath/p:{0}"'
-                    ' >> {1}/hbase-env.sh').format(_GetALPNLocalPath(),
-                                                   hbase.HBASE_CONF_DIR))
+  vm.RemoteCommand('echo "export JAVA_HOME=/usr" >> {0}/hbase-env.sh'.format(
+      hbase.HBASE_CONF_DIR))
 
   context = {
       'google_bigtable_endpoint': FLAGS.google_bigtable_endpoint,
       'google_bigtable_admin_endpoint': FLAGS.google_bigtable_admin_endpoint,
       'project': FLAGS.project or _GetDefaultProject(),
-      'cluster': FLAGS.google_bigtable_cluster_name,
+      'cluster': cluster_name,
       'zone': FLAGS.google_bigtable_zone_name,
+      'hbase_version': HBASE_VERSION.replace('.', '_')
   }
 
   for file_name in HBASE_CONF_FILES:
@@ -230,6 +232,23 @@ def Prepare(benchmark_spec):
   benchmark_spec.always_call_cleanup = True
   vms = benchmark_spec.vms
 
+  # TODO: in the future, it might be nice to chagne this so that
+  # a gcp_bigtable.GcpBigtableCluster can be created with an
+  # flag that says don't create/delete the cluster.  That would
+  # reduce the code paths here.
+  if FLAGS.google_bigtable_cluster_name is None:
+    cluster_name = 'pkb-bigtable-{0}'.format(FLAGS.run_uri)
+    project = FLAGS.project or _GetDefaultProject()
+    logging.info('Creating bigtable cluster %s', cluster_name)
+    zone = FLAGS.google_bigtable_zone_name
+    benchmark_spec.bigtable_cluster = gcp_bigtable.GcpBigtableCluster(
+        cluster_name, CLUSTER_SIZE, project, zone)
+    benchmark_spec.bigtable_cluster.Create()
+    cluster = _GetClusterDescription(project,
+                                     FLAGS.google_bigtable_zone_name,
+                                     cluster_name)
+    logging.info('Cluster %s created successfully', cluster)
+
   vm_util.RunThreaded(_Install, vms)
 
   # Create table
@@ -251,19 +270,20 @@ def Run(benchmark_spec):
 
   table_name = _GetTableName()
 
-  # Add hbase conf dir to the classpath, ALPN to the bootclasspath.
+  # Add hbase conf dir to the classpath.
   ycsb_memory = ycsb_memory = min(vms[0].total_memory_kb // 1024, 4096)
-  jvm_args = pipes.quote('-Xmx{0}m -Xbootclasspath/p:{1}'.format(
-      ycsb_memory, _GetALPNLocalPath()))
+  jvm_args = pipes.quote(' -Xmx{0}m'.format(ycsb_memory))
 
   executor_flags = {'cp': hbase.HBASE_CONF_DIR,
                     'jvm-args': jvm_args,
                     'table': table_name}
 
   executor = ycsb.YCSBExecutor('hbase-10', **executor_flags)
+  cluster_name = (FLAGS.google_bigtable_cluster_name or
+                  'pkb-bigtable-{0}'.format(FLAGS.run_uri))
   cluster_info = _GetClusterDescription(FLAGS.project or _GetDefaultProject(),
                                         FLAGS.google_bigtable_zone_name,
-                                        FLAGS.google_bigtable_cluster_name)
+                                        cluster_name)
 
   metadata = {'ycsb_client_vms': len(vms),
               'bigtable_nodes': cluster_info.get('serveNodes')}
@@ -276,7 +296,12 @@ def Run(benchmark_spec):
       'columnfamily': COLUMN_FAMILY,
       'clientbuffering': 'false'}
   load_kwargs = run_kwargs.copy()
+
+  # During the load stage, use a buffered mutator with a single thread.
+  # The BufferedMutator will handle multiplexing RPCs.
   load_kwargs['clientbuffering'] = 'true'
+  if not FLAGS['ycsb_preload_threads'].present:
+    load_kwargs['threads'] = 1
   samples = list(executor.LoadAndRun(vms,
                                      load_kwargs=load_kwargs,
                                      run_kwargs=run_kwargs))
@@ -293,8 +318,12 @@ def Cleanup(benchmark_spec):
     benchmark_spec: The benchmark specification. Contains all data that is
         required to run the benchmark.
   """
-  vm = benchmark_spec.vms[0]
-  # Delete table
-  command = ("""echo 'disable "{0}"; drop "{0}"; exit' | """
-             """{1}/hbase shell""").format(_GetTableName(), hbase.HBASE_BIN)
-  vm.RemoteCommand(command, should_log=True, ignore_failure=True)
+ # Delete table
+  if FLAGS.google_bigtable_cluster_name is None:
+    benchmark_spec.bigtable_cluster.Delete()
+  else:
+    # Only need to drop the tables if we're not deleting the cluster.
+    vm = benchmark_spec.vms[0]
+    command = ("""echo 'disable "{0}"; drop "{0}"; exit' | """
+               """{1}/hbase shell""").format(_GetTableName(), hbase.HBASE_BIN)
+    vm.RemoteCommand(command, should_log=True, ignore_failure=True)

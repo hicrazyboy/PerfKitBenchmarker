@@ -14,6 +14,7 @@
 """Tests for perfkitbenchmarker.publisher."""
 
 import collections
+import csv
 import io
 import json
 import re
@@ -190,6 +191,12 @@ class SampleCollectorTestCase(unittest.TestCase):
     self.benchmark = 'test!'
     self.benchmark_spec = mock.MagicMock()
 
+    p = mock.patch(publisher.__name__ + '.FLAGS')
+    self.mock_flags = p.start()
+    self.addCleanup(p.stop)
+
+    self.mock_flags.product_name = 'PerfKitBenchmarker'
+
   def _VerifyResult(self, contains_metadata=True):
     self.assertEqual(1, len(self.instance.samples))
     collector_sample = self.instance.samples[0]
@@ -294,6 +301,19 @@ class DefaultMetadataProviderTestCase(unittest.TestCase):
                     data_disk_0_num_stripes=1)
     self._RunTest(self.mock_spec, expected)
 
+  def testAddMetadata_DiskSizeNone(self):
+    # This situation can happen with static VMs
+    self.mock_disk.configure_mock(disk_type='disk-type',
+                                  disk_size=None)
+    self.mock_vm.configure_mock(scratch_disks=[self.mock_disk])
+    expected = self.default_meta.copy()
+    expected.update(scratch_disk_size=None,
+                    scratch_disk_type='disk-type',
+                    data_disk_0_size=None,
+                    data_disk_0_type='disk-type',
+                    data_disk_0_num_stripes=1)
+    self._RunTest(self.mock_spec, expected)
+
   def testAddMetadata_PIOPS(self):
     self.mock_disk.configure_mock(disk_type='disk-type',
                                   iops=1000)
@@ -335,3 +355,38 @@ class DefaultMetadataProviderTestCase(unittest.TestCase):
                     data_disk_0_foo='bar',
                     data_disk_0_legacy_disk_type='remote_ssd')
     self._RunTest(self.mock_spec, expected)
+
+
+class CSVPublisherTestCase(unittest.TestCase):
+  def setUp(self):
+    self.tf = tempfile.NamedTemporaryFile(prefix='perfkit-csv-publisher',
+                                          suffix='.csv')
+    self.addCleanup(self.tf.close)
+
+  def testWritesToStream(self):
+    instance = publisher.CSVPublisher(self.tf.name)
+    samples = [{'test': 'testb', 'metric': '1', 'value': 1.0, 'unit': 'MB',
+                'metadata': {}},
+               {'test': 'testb', 'metric': '2', 'value': 14.0, 'unit': 'MB',
+                'metadata': {}},
+               {'test': 'testa', 'metric': '3', 'value': 47.0, 'unit': 'us',
+                'metadata': {}}]
+    instance.PublishSamples(samples)
+    self.tf.seek(0)
+    rows = list(csv.DictReader(self.tf))
+    self.assertItemsEqual(['1', '2', '3'], [i['metric'] for i in rows])
+
+  def testUsesUnionOfMetaKeys(self):
+    instance = publisher.CSVPublisher(self.tf.name)
+    samples = [{'test': 'testb', 'metric': '1', 'value': 1.0, 'unit': 'MB',
+                'metadata': {'key1': 'value1'}},
+               {'test': 'testb', 'metric': '2', 'value': 14.0, 'unit': 'MB',
+                'metadata': {'key1': 'value2'}},
+               {'test': 'testa', 'metric': '3', 'value': 47.0, 'unit': 'us',
+                'metadata': {'key3': 'value3'}}]
+    instance.PublishSamples(samples)
+    self.tf.seek(0)
+    reader = csv.DictReader(self.tf)
+    rows = list(reader)
+    self.assertEqual(['key1', 'key3'], reader.fieldnames[-2:])
+    self.assertEqual(3, len(rows))

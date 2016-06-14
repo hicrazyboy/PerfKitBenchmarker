@@ -28,10 +28,10 @@ from perfkitbenchmarker import flags
 from perfkitbenchmarker import network
 from perfkitbenchmarker import resource
 from perfkitbenchmarker import vm_util
+from perfkitbenchmarker import providers
 
 FLAGS = flags.FLAGS
 AZURE_PATH = 'azure'
-AZURE = 'Azure'
 MAX_NAME_LENGTH = 24
 SSH_PORT = 22
 # We need to prefix storage account names so that VMs won't create their own
@@ -40,13 +40,66 @@ SSH_PORT = 22
 STORAGE_ACCOUNT_PREFIX = 'portalvhds'
 
 
+class _AzureEndpoint(resource.BaseResource):
+  """An object representing an endpoint to an Azure VM.
+
+  No deletion is specified, as endpoints are deleted along with the VM.
+  """
+  def __init__(self, vm_name, port, protocol):
+    super(_AzureEndpoint, self).__init__()
+    self.vm_name = vm_name
+    self.port = port
+    self.protocol = protocol
+
+  def _Create(self):
+    create_cmd = [AZURE_PATH,
+                  'vm',
+                  'endpoint',
+                  'create',
+                  self.vm_name,
+                  str(self.port),
+                  '--protocol=' + self.protocol]
+    vm_util.IssueCommand(create_cmd)
+
+  def _Exists(self):
+    """Returns whether or not an endpoint exists."""
+    # Example output:
+    # [
+    #   {
+    #     "localPort": 22,
+    #     "name": "ssh",
+    #     "port": 22,
+    #     "protocol": "tcp",
+    #     "virtualIPAddress": "104.43.224.13",
+    #     "enableDirectServerReturn": false
+    #   }
+    # ]
+    exists_cmd = [AZURE_PATH,
+                  'vm',
+                  'endpoint',
+                  'list',
+                  '--json',
+                  self.vm_name]
+    stdout, _, status = vm_util.IssueCommand(exists_cmd)
+    if status or stdout == 'No VMs found':
+      return False
+    else:
+      arr = json.loads(stdout)
+      return any(ep['port'] == self.port and ep['protocol'] == self.protocol
+                 for ep in arr)
+
+  def _Delete(self):
+    """Endpoint will be deleted with VM, so this is a noop."""
+    pass
+
+
 class AzureFirewall(network.BaseFirewall):
   """An object representing the Azure Firewall equivalent.
 
   On Azure, endpoints are used to open ports instead of firewalls.
   """
 
-  CLOUD = AZURE
+  CLOUD = providers.AZURE
 
   def AllowPort(self, vm, port):
     """Opens a port on the firewall.
@@ -57,16 +110,8 @@ class AzureFirewall(network.BaseFirewall):
     """
     if vm.is_static or port == SSH_PORT:
       return
-    create_cmd = [AZURE_PATH,
-                  'vm',
-                  'endpoint',
-                  'create',
-                  vm.name,
-                  str(port)]
-    vm_util.IssueRetryableCommand(
-        create_cmd + ['--protocol=tcp'])
-    vm_util.IssueRetryableCommand(
-        create_cmd + ['--protocol=udp'])
+    _AzureEndpoint(vm.name, port, 'tcp').Create()
+    _AzureEndpoint(vm.name, port, 'udp').Create()
 
   def DisallowAllPorts(self):
     """Closes all ports on the firewall."""
@@ -209,7 +254,7 @@ class AzureVirtualNetwork(resource.BaseResource):
 class AzureNetwork(network.BaseNetwork):
   """Object representing an Azure Network."""
 
-  CLOUD = AZURE
+  CLOUD = providers.AZURE
 
   def __init__(self, spec):
     super(AzureNetwork, self).__init__(spec)

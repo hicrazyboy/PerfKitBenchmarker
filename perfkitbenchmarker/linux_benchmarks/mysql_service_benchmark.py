@@ -32,9 +32,10 @@ import StringIO
 import time
 import uuid
 
-from perfkitbenchmarker import benchmark_spec as benchmark_spec_class
+from perfkitbenchmarker import providers
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import flags
+from perfkitbenchmarker import os_types
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.providers.aws import aws_network
@@ -135,28 +136,12 @@ def GetConfig(user_config):
   return configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
 
 
-def CheckPrerequisites():
-  """Verifies that we are running on a cloud provider that supports managed
-     MySQL service.
-
-  Raises:
-    ProviderNotSupportedError
-  """
-  if FLAGS.cloud != 'GCP' and FLAGS.cloud != 'AWS':
-    raise ProviderNotSupportedError('Provider %s is not supported yet.' %
-                                    FLAGS.cloud)
-
-
-class ProviderNotSupportedError(Exception):
-  pass
-
-
 class DBStatusQueryError(Exception):
   pass
 
 
 def _GenerateRandomPassword():
-  """ Generates a random password to be used by the DB instance.
+  """Generates a random password to be used by the DB instance.
   Args:
     None
   Returns:
@@ -283,21 +268,24 @@ def ParseSysbenchOutput(sysbench_output, results, metadata):
         metadata))
 
 
-def _GetSysbenchCommandPrefix():
-  """ Decides what the prefix is for sysbench command based on os type.
+def _GetSysbenchCommandPrefix(os_type):
+  """Determines the prefix for a sysbench command based on the operating system.
+
   Args:
-    None.
+    os_type: string. Operating system of the machine on which the sysbench
+        command will be executed. Chosen from os_types.ALL.
+
   Returns:
     A string representing the sysbench command prefix.
   """
-  if FLAGS.os_type == 'rhel':
+  if os_type == os_types.RHEL:
     return vm_util.VM_TMP_DIR
   else:
     return NORMAL_SYSBENCH_PATH_PREFIX
 
 
 def _IssueSysbenchCommand(vm, duration):
-  """ Issues a sysbench run command given a vm and a duration.
+  """Issues a sysbench run command given a vm and a duration.
 
       Does nothing if duration is <= 0
 
@@ -310,7 +298,7 @@ def _IssueSysbenchCommand(vm, duration):
   """
   stdout = ''
   stderr = ''
-  oltp_script_path = '%s%s' % (_GetSysbenchCommandPrefix(), OLTP_SCRIPT_PATH)
+  oltp_script_path = _GetSysbenchCommandPrefix(vm.OS_TYPE) + OLTP_SCRIPT_PATH
   if duration > 0:
     run_cmd_tokens = ['sysbench',
                       '--test=%s' % oltp_script_path,
@@ -342,7 +330,7 @@ def _IssueSysbenchCommand(vm, duration):
 
 
 def _RunSysbench(vm, metadata):
-  """ Runs the Sysbench OLTP test.
+  """Runs the Sysbench OLTP test.
 
   The test is run on the DB instance as indicated by the vm.db_instance_address.
 
@@ -374,8 +362,8 @@ def _RunSysbench(vm, metadata):
   # Provision the Sysbench test based on the input flags (load data into DB)
   # Could take a long time if the data to be loaded is large.
   data_load_start_time = time.time()
-  prepare_script_path = '%s%s' % (_GetSysbenchCommandPrefix(),
-                                  PREPARE_SCRIPT_PATH)
+  prepare_script_path = (_GetSysbenchCommandPrefix(vm.OS_TYPE) +
+                         PREPARE_SCRIPT_PATH)
   data_load_cmd_tokens = ['sysbench',
                           '--test=%s' % prepare_script_path,
                           '--mysql_svc_oltp_tables_count=%d' %
@@ -631,21 +619,21 @@ class RDSMySQLBenchmark(object):
     for status_query_count in xrange(1, DB_STATUS_QUERY_LIMIT + 1):
       try:
         response = json.loads(stdout)
-        db_status = _RDSParseDBInstanceStatus(response)
-
-        if db_status == 'deleting':
-          logging.info('DB is still in the deleting state, status_query_count '
-                       'is %d', status_query_count)
-          # Wait for a few seconds and query status
-          time.sleep(DB_STATUS_QUERY_INTERVAL)
-          stdout, stderr, _ = vm_util.IssueCommand(status_query_cmd)
-        else:
-          logging.info('DB deletion status is no longer in deleting, it is %s',
-                       db_status)
-          break
-      except:
+      except ValueError:
         # stdout cannot be parsed into json, it might simply be empty because
         # deletion has been completed.
+        break
+
+      db_status = _RDSParseDBInstanceStatus(response)
+      if db_status == 'deleting':
+        logging.info('DB is still in the deleting state, status_query_count '
+                     'is %d', status_query_count)
+        # Wait for a few seconds and query status
+        time.sleep(DB_STATUS_QUERY_INTERVAL)
+        stdout, stderr, _ = vm_util.IssueCommand(status_query_cmd)
+      else:
+        logging.info('DB deletion status is no longer in deleting, it is %s',
+                     db_status)
         break
     else:
       logging.warn('DB is still in deleting state after long wait, bail.')
@@ -690,7 +678,7 @@ class GoogleCloudSQLBenchmark(object):
   """MySQL benchmark based on the Google Cloud SQL service."""
 
   def Prepare(self, vm):
-    """Prepares the DB and everything for the provider GCP (Cloud SQL)
+    """Prepares the DB and everything for the provider GCP (Cloud SQL).
 
     Args:
       vm: The VM to be used as the test client
@@ -802,8 +790,8 @@ class GoogleCloudSQLBenchmark(object):
 
 
 MYSQL_SERVICE_BENCHMARK_DICTIONARY = {
-    benchmark_spec_class.GCP: GoogleCloudSQLBenchmark(),
-    benchmark_spec_class.AWS: RDSMySQLBenchmark()}
+    providers.GCP: GoogleCloudSQLBenchmark(),
+    providers.AWS: RDSMySQLBenchmark()}
 
 
 def Prepare(benchmark_spec):

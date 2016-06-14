@@ -1,3 +1,297 @@
+# 1.5.0
+
+New features:
+* Add cloudsuite graph analytics benchmark (thanks @mdrumond; GH-986)
+* Add initial implementation of multichase benchmark (GH-977)
+* Add cloudsuite media streaming benchmark (thanks @ivonindza; GH-993)
+* Add analysis functions for processing multistream object storage benchmark data (GH-905)
+* Add CloudSuite Data-caching benchmark (thanks @neo-apz; GH-970)
+* Add ability to bundle PKB into a python-executable zip file (GH-971)
+* Add os_type for Juju Mixin (thanks @AdamIsrael; GH-764)
+* Add CloudSuite in-memory analytics benchmark (thanks @ivonindza; GH-934)
+
+Breaking changes:
+* Replace the old CloudSuite Web Search benchmark with the docker version (thanks @javpicorel; GH-931)
+* Update Aerospike version (GH-978)
+
+Enhancements:
+* Add --fio_blocksize option (GH-943)
+* Update speccpu2006 benchmark to support iso file (GH-944)
+* Allow --run_stage to specify multiple stages (GH-935)
+* Add flag to control iperf timeout (GH-994)
+
+Bugfixes and maintenance updates:
+* Fix cloud bigtable and hbase (GH-1001)
+* Install openssl for the object storage benchmark (GH-1000)
+* Fix bug in MongoDB YCSB benchmark (GH-999)
+* Change import_util.LoadModulesForPath to also load packages (GH-983)
+* Add 'ap-northeast-2' to the S3 regions table (GH-990)
+* Change check-lint.sh to invoke flake8 via tox (GH-979)
+* Change GetLastRunUri to handle the new temp directory structure (GH-985)
+* Support S3 Signature Version 4 (GH-984)
+* Add back support for python-gflags version 2. (GH-973)
+* Define units.Unit.\_\_ne\_\_ (GH-976)
+* Reorder some PKB initialization steps (GH-965)
+* Move to gflags version 3.0.4 (GH-969)
+* Modify semantics of UnitsParser's convertible_to parameter (GH-968)
+* Add percent (%) as a recognized pint unit (GH-964)
+* Improve Azure CLI version check (GH-967, GH-958)
+* Don't request SSH verbose output when --log_level=debug (GH-962)
+* Move per-provider package requirement files (GH-961)
+* Move pint unit registry code into a separate module (GH-960)
+* Only check python package requirements if requirements.txt exists (GH-959)
+* Changed LoadProvider to accept un-lowered cloud provider name (GH-957)
+* Change bg tests to patch and verify call counts for each VM separately (GH-954)
+* Make BenchmarkSpec.vms order consistent across runs (GH-953)
+* Fix os type related issues and bugs (GH-950, GH-955, GH-952, GH-951, GH-949)
+* Call CheckPrerequisites earlier (GH-947)
+* Add percentiles option to PercentilesCalculator (GH-910)
+* Fix publisher bug when disk_size is None (GH-946)
+* Handle unset PYTHONPATH in tox.ini (GH-941)
+* Add a helper function to BenchmarkConfigSpec to redirect flags (GH-936)
+* Add support for interrupting child threads created by RunThreaded (GH-926)
+* Fix bugs and improve the Cloud Bigtable benchmark (GH-937, GH-933, GH-932)
+* Add a helpful error message if a UnitsParser parses a unitless value (GH-963)
+
+# 1.4.0
+
+New features:
+
+* openstack: Add support for optional floating ip pool (thanks @meteorfox, GH-861)
+* openstack: Use Keystone session for handling authentication (thanks @meteorfox, GH-870) 
+* Support object storage classes in object storage service benchmarks (GH-895)
+* Add Object Size Distributions in object storage service benchmarks (GH-888)
+* Add MultiStreamThroughput benchmark to object storage benchmarks (GH-840)
+* Adds a SPEC SFS 2014 benchmark which runs against GlusterFS (GH-876)
+* gce_virtual_machine: Support user provided instance metadata (GH-859)
+
+Improvements and fixes:
+
+* openstack: Wait until VM deletion has been completed (thanks @meteorfox, GH-904)
+* openstack: Fix floating IP allocation and deallocation (thanks @meteorfox, GH-862)
+* rackspace: Fix missing flags bug (thanks @meteorfox, GH-903)
+* Allow user to specify a flag when they run object storage benchmark on GCP, and default that flag to the latest known working version. (GH-925)
+* Update mechanism used to get iperf server process id. (GH-921)
+* Rename variables and improve documentation of BaseOsMixin.PullFile. (GH-923)
+* Fix WindowsMixin._GetNumCpus when more than one Win32_processor exists. (GH-920)
+* Add exception types to except clauses. (GH-893)
+* Add Flag for List Consistency Iterations (GH-889)
+* Add unit tests for scripts (GH-882)
+* Add disk type examples to README.md (GH-871)
+* Copy-edit the README (GH-877)
+* Turn off selinux for mongodb. (thanks @akrzos, GH-867)
+* Use temp files for Popen stdout and stderr in IssueCommand. (GH-878)
+
+# 1.3.0
+
+External contributions:
+* Add RHEL based virtual machines to OpenStack provider. (thanks @akrzos;
+  GH-858)
+* Change rackspace provider information to use official CLI (thanks @meteorfox; GH-844)
+* Add rackspace requirements (thanks @meteorfox; GH-805)
+
+New features:
+* Support flags in YAML format. (GH-857)
+* Check version of required packages at runtime (GH-834)
+* User-specified multiregion for GCS benchmarking (GH-845)
+* Support metadata for gcp instances (GH-859)
+
+Bugfixes and maintenance updates:
+* Change rackspace's AllowPort to enable UDP (thanks @meteorfox; GH-805)
+* Allow most recent verison gcs-oauth2-boto-plugin (GH-849)
+* Require Pint >= 0.7 (GH-850)
+* Update PIP (GH-842)
+* Fix windows log message (GH-832)
+* Properly Pickle Pint Quantities (GH-830)
+* os_type added to boot benchmark metadata (GH-826)
+* Better handle Azure timeouts (GH-825)
+* Better handling of AWS integration tests. (GH-869, GH-868)
+
+# 1.2.0
+
+New features:
+* Introduced Object Sizes in flags (GH-808).
+* Add ListDecoder for verifying a config option that expects list values
+  (GH-807).
+
+Enhancements:
+* Bump HBase to 1.0.3 in hbase_ycsb benchmark (GH-822).
+* Change MockFlags to be more like the real FlagValues (GH-812).
+* Rename test_flag_util.py and add FlagDictSubstitution tests (GH-811).
+* Create BenchmarkConfigSpec to aggregate benchmark input checking (GH-810).
+* Remove flag proxy objects (GH-802).
+
+Bugfixes and maintenance updates:
+* Fix sample iperf config (GH-801).
+* FixIntDecoder and FloatDecoder behavior when min=0 or max=0 (GH-800).
+
+# 1.1.0
+
+External contributions:
+* Add additional percentile samples to mysql_service benchmark and others
+  (thanks @zbjornson; GH-729).
+* Add Mesos-Marathon as a provider (thanks @mateusz-blaszkowski; GH-679,
+  GH-731).
+* Use only available floating-ips for OpenStack (thanks @meteorfox; GH-733).
+* Add OpenStack CLI-based support for object_storage_service benchmark (thanks
+  @meteorfox; GH-738).
+* Make printed benchmark results more readable (thanks @wonderfly; GH-747).
+* Clean up formatting, grammar, and markdown in README.md (thanks @mbrukman;
+  GH-748).
+* Add links to projects and licenses in README.md (thanks @mbrukman; GH-763).
+* Fix a bug that caused --helpxml to not work (thanks @jldiaz; GH-782).
+* Make OpenStack VM username configurable with a new --openstack_image_username
+  flag (thanks @lwatta; GH-788).
+
+New features:
+* Allow users to specify a storage region for the object_storage_service
+  benchmark with a new --object_storage_region flag (GH-609).
+* Add support for running a background CPU workload while executing a benchmark
+  (GH-715, GH-762).
+* Allow creating GCE custom VMs easily from command-line flags (GH-727).
+* Add the --gce_network_name to allow GCE users to use pre-existing networks
+  (GH-746).
+* Publish a PTRANS sample from the hpcc benchmark (GH-785).
+* Add support for running a background network workload while executing a
+  benchmark (GH-786).
+* Add a CSV sample output format (GH-791).
+
+Enhancements:
+* Trim blocks while formatting and mounting disks (GH-692).
+* Raise an error when no requests succeed in redis_benchmark (GH-702).
+* Update the Google benchmark set (GH-705).
+* Add input-checking to disk specs (GH-675, GH-779).
+* Let disks on Windows machines return Windows DeviceIds (GH-743).
+* Speed up Cassandra cluster boot by setting "auto_bootstrap" to false (GH-751).
+* Defer package update for Ubuntu (GH-752).
+* Add provider-specific requirements.txt files (GH-753).
+* Increase preload thread count for YCSB benchmarks (GH-760). This change
+  affects some of the samples generated by the aerospike_ycsb, cassandra_ycsb,
+  and mongodb_ycsb benchmarks, including the overall Runtime and overall
+  Throughput.
+* Guarantee order of VM and disk spec config option decoding (GH-792).
+
+Bugfixes and maintenance updates:
+* Create one AWS VPC/IGW/PlacementGroup per region (GH-687, GH-798).
+* Update README.md instructions for setting up PKB for GCE (GH-689).
+* Update comments in pkb.py to reflect new provision and teardown stages
+  (GH-691).
+* Fix bug that prevented object_storage_service benchmark from running in stages
+  (GH-694).
+* Add test helpers that make it easier to mock command-line flags (GH-695,
+  GH-730).
+* Delete set-interrupts.sh (GH-703).
+* Make process exit status non-zero upon benchmark failure (GH-713).
+* Move "To run again" message from teardown to cleanup stage (GH-714).
+* Fix creation of AWS VMs using Placement Groups (GH-721).
+* Create AWS/GCE default access rules before creating VMs (GH-726, GH-756).
+  This change affects the Boot Time measured by the cluster_boot benchmark.
+* Fix a GCE boot disk creation bug (GH-736).
+* ntttcp benchmark fixes (GH-737).
+* Force mongodb_ycsb benchmark to use only one VM (GH-755).
+* Unmount /mnt if it exists prior to creating a scratch filesystem (GH-757).
+* Move provider constants to a separate module (GH-758).
+* Fix a bug when creating an AWS VPC outside the user's default region (GH-774).
+* Add tests for generating help strings (GH-782).
+* Kill servers started by the iperf benchmark as part of its cleanup (GH-784).
+* Fix some style inconsistencies (GH-789).
+* Move operating system constants to a separate module (GH-790).
+* Fix some broken tests (GH-795, GH-796).
+
+# 1.0.1
+
+* Fix for benchmark_compatibility_checking flag. (thanks @mateusz-blaszkowski;
+  GH-707)
+
+# 1.0.0
+
+New features:
+* Added decoders to configs which allow for additional config validation
+  (GH-672)
+* Add support for GCE custom VMs (GH-664)
+* Providers can now selectively support benchmarks (GH-690)
+
+Breaking changes:
+* Enhanced config usage by multi-node benchmarks - this changes some of their
+  default metadata. (GH-669)
+* YCSB histogram results are now not included by default (GH-656)
+
+Enhancements:
+* Ping benchmark is now bi-directional (GH-685)
+* Metadata flag can be specified multiple times (GH-684)
+* Allow AWS regions as well as zones (GH-658)
+* Added 'vm_count' metadata to all benchmarks (GH-659)
+* GCP now creates networks (GH-648)
+* Added provision and teardown run_stages (GH-652)
+* Update tomcat_wrk to report more samples (GH-650)
+* Add a flag to control the log file log level (GH-651)
+
+Bugfixes and maintenance updates:
+* Added helper for mocking FLAGS (GH-678)
+* Fix for silo benchmark which fails when running behind proxy (thanks
+  @mateusz-blaszkowski; GH-680)
+* Fix for not-installed curl package (thanks @mateusz-blaszkowski; GH-681)
+* Invoke YCSB from its installation directory (GH-677)
+* Fix bug with detecting run_uris (GH-673)
+* Fix the image_project flag so it works as intended (thanks @wonderfly; GH-666)
+* Add explicit --boot-disk-auto-delete to GCE VM creation (GH-670)
+* Improved the README layout and fixed errors (GH-661, GH-660)
+* Broaden exception caught during PKB run (GH-667)
+* Fixed bug with run stages (GH-665)
+* Fixed formatting of docstring (thanks @wonderfly; GH-662)
+* Fixed bug with GCP networks (GH-663)
+* Add GetMachineTypeDict() to replace machine_type in Sample metadata (GH-653)
+* Add GcloudCommand helper (GH-649)
+* Fixed Tomcat download URL (GH-700)
+* Retry RemoteCopy operations (GH-699)
+* Various fixes to data disks for OpenStack (thanks @meteorfox; GH-688)
+
+# 0.24.0
+
+New features:
+* CS2 rachel web serving benchmark (thanks @rmend016; GH-451)
+* Add [AliCloud](http://intl.aliyun.com/) provider (thanks @hicrazyboy; GH-611)
+* Add tomcat/wrk benchmark (GH-598)
+
+Breaking changes:
+* Remove `--parallelism` flag (GH-633)
+* Rename `fio` flags (GH-518, GH-581)
+* Added new disk type options to clarify use. (Breaking change) we will remove
+  the current options in a coming release (GH-599)
+
+Enhancements:
+* Docker support in DigitalOcean and StaticVirtualMachine (thanks @maxking; GH-528)
+* Always use latest Azure package (GH-585)
+* Support `read/counter_read/mixed` in cassandra_stress benchmark (GH-607,
+  GH-592)
+* Add pretty-printed benchmark run summary table (GH-620)
+* Support new configs in the
+  [Cloudsuite web serving](http://parsa.epfl.ch/cloudsuite/web.html) benchmark
+  (GH-605)
+
+Bugfixes and maintenance updates:
+* Move providers to their own directory (GH-617)
+* Automatically register VM classes and specs (GH-600)
+* Only load needed provider modules (GH-635, GH-636)
+* Prefix benchmark and packages directories with `linux_` (GH-640)
+* Update to OpenStack Nova (thanks @meteorfox; GH-613)
+* Add `AUTHORS` file; update copyright header (GH-618)
+* Continue executing benchmarks after one fails (GH-614)
+* Disk integration tests for GCE, AWS, Azure (GH-571, GH-595)
+* Update Windows `cluster_boot` benchmark to match Linux one (GH-647)
+* Update `README` for lazy-loading providers (GH-645)
+* Only call `SetupPackageManager` if `install_packages` is True (GH-644)
+* Generate per-VM-group SSH aliases (GH-639)
+* Move AWS and Azure `_GetDefaultImage` calls to `_CreateDependencies` (GH-641)
+* Get Azure default image name from `azure vm image list` (GH-637)
+* Add `boto` lib version to object storage benchmark metadata (GH-632)
+* Improve the guide on using Docker (thanks @mateusz-blaszkowski; GH-628)
+* Improvements to VM pool handling (GH-626, GH-608)
+* Make benchmark metadata specify benchmark name (GH-615)
+* Support overriding Azure client lib version (GH-587)
+* Update Cassandra version to 2.1.10 (GH-577)
+
+
 # v0.23.0
 
 Known Issues:

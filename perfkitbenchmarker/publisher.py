@@ -15,11 +15,13 @@
 """Classes to collect and publish performance samples to various sinks."""
 
 import abc
+import csv
 import io
 import itertools
 import json
 import logging
 import operator
+import pprint
 import sys
 import time
 import uuid
@@ -27,6 +29,7 @@ import uuid
 from perfkitbenchmarker import disk
 from perfkitbenchmarker import events
 from perfkitbenchmarker import flags
+from perfkitbenchmarker import flag_util
 from perfkitbenchmarker import version
 from perfkitbenchmarker import vm_util
 
@@ -52,7 +55,11 @@ flags.DEFINE_string(
 flags.DEFINE_boolean(
     'collapse_labels',
     True,
-    'Collapse entries in labels.')
+    'Collapse entries in labels in JSON output.')
+flags.DEFINE_string(
+    'csv_path',
+    None,
+    'A path to write CSV-format results')
 
 flags.DEFINE_string(
     'bigquery_table',
@@ -76,12 +83,13 @@ flags.DEFINE_string(
     None,
     'GCS bucket to upload records to. Bucket must exist.')
 
-flags.DEFINE_list(
+flags.DEFINE_multistring(
     'metadata',
     [],
-    'A list of key-value pairs that will be added to the labels field of all '
-    'samples as metadata. Each key-value pair in the list should be colon '
-    'separated.')
+    'A colon separated key-value pair that will be added to the labels field '
+    'of all samples as metadata. Multiple key-value pairs may be specified '
+    'by separating each pair by commas. This option can be repeated multiple '
+    'times.')
 
 DEFAULT_JSON_OUTPUT_NAME = 'perfkitbenchmarker_results.json'
 DEFAULT_CREDENTIALS_JSON = 'credentials.json'
@@ -146,20 +154,22 @@ class DefaultMetadataProvider(MetadataProvider):
 
       if vm.scratch_disks:
         data_disk = vm.scratch_disks[0]
+        disk_type = data_disk.disk_type
+        disk_size = data_disk.disk_size
+        num_stripes = data_disk.num_striped_disks
         # Legacy metadata keys
-        metadata[name_prefix + 'scratch_disk_type'] = data_disk.disk_type
-        metadata[name_prefix + 'scratch_disk_size'] = data_disk.disk_size
+        metadata[name_prefix + 'scratch_disk_type'] = disk_type
+        metadata[name_prefix + 'scratch_disk_size'] = disk_size
         metadata[name_prefix + 'num_striped_disks'] = (
             data_disk.num_striped_disks)
         if getattr(data_disk, 'iops', None) is not None:
           metadata[name_prefix + 'scratch_disk_iops'] = data_disk.iops
           metadata[name_prefix + 'aws_provisioned_iops'] = data_disk.iops
         # Modern metadata keys
-        metadata[name_prefix + 'data_disk_0_type'] = data_disk.disk_type
+        metadata[name_prefix + 'data_disk_0_type'] = disk_type
         metadata[name_prefix + 'data_disk_0_size'] = (
-            data_disk.disk_size * data_disk.num_striped_disks)
-        metadata[name_prefix + 'data_disk_0_num_stripes'] = (
-            data_disk.num_striped_disks)
+            disk_size * num_stripes if disk_size else disk_size)
+        metadata[name_prefix + 'data_disk_0_num_stripes'] = num_stripes
         if getattr(data_disk, 'metadata', None) is not None:
           if disk.LEGACY_DISK_TYPE in data_disk.metadata:
             metadata[name_prefix + 'scratch_disk_type'] = (
@@ -167,15 +177,11 @@ class DefaultMetadataProvider(MetadataProvider):
           for key, value in data_disk.metadata.iteritems():
             metadata[name_prefix + 'data_disk_0_' + key] = value
 
-    # User specified metadata
-    for pair in FLAGS.metadata:
-      try:
-        key, value = pair.split(':')
-        metadata[key] = value
-      except ValueError:
-        logging.error('Bad metadata flag format. Skipping "%s".', pair)
-        continue
-
+    # Flatten all user metadata into a single list (since each string in the
+    # FLAGS.metadata can actually be several key-value pairs) and then iterate
+    # over it.
+    parsed_metadata = flag_util.ParseKeyValuePairs(FLAGS.metadata)
+    metadata.update(parsed_metadata)
     return metadata
 
 
@@ -199,6 +205,39 @@ class SamplePublisher(object):
       samples: list of dicts to publish.
     """
     raise NotImplementedError()
+
+
+
+class CSVPublisher(SamplePublisher):
+  """Publisher which writes results in CSV format to a specified path.
+
+  The default field names are written first, followed by all unique metadata
+  keys found in the data.
+  """
+
+  _DEFAULT_FIELDS = ('timestamp', 'test', 'metric', 'value', 'unit',
+                     'product_name', 'official', 'owner', 'run_uri',
+                     'sample_uri')
+
+  def __init__(self, path):
+    self._path = path
+
+  def PublishSamples(self, samples):
+    samples = list(samples)
+    # Union of all metadata keys.
+    meta_keys = sorted(
+        set(key for sample in samples for key in sample['metadata']))
+
+    logging.info('Writing CSV results to %s', self._path)
+    with open(self._path, 'w') as fp:
+      writer = csv.DictWriter(fp, list(self._DEFAULT_FIELDS) + meta_keys)
+      writer.writeheader()
+
+      for sample in samples:
+        d = {}
+        d.update(sample)
+        d.update(d.pop('metadata'))
+        writer.writerow(d)
 
 
 class PrettyPrintStreamPublisher(SamplePublisher):
@@ -333,6 +372,7 @@ class LogPublisher(SamplePublisher):
   def __init__(self, level=logging.INFO, logger=None):
     self.level = level
     self.logger = logger or logging.getLogger()
+    self._pprinter = pprint.PrettyPrinter()
 
   def __repr__(self):
     return '<{0} logger={1} level={2}>'.format(type(self).__name__, self.logger,
@@ -343,7 +383,7 @@ class LogPublisher(SamplePublisher):
         '\n' + '-' * 25 + 'PerfKitBenchmarker Complete Results' + '-' * 25 +
         '\n']
     for sample in samples:
-      data.append('%s\n' % sample)
+      data.append('%s\n' % self._pprinter.pformat(sample))
     self.logger.log(self.level, ''.join(data))
 
 
@@ -537,6 +577,8 @@ class SampleCollector(object):
     if FLAGS.cloud_storage_bucket:
       publishers.append(CloudStoragePublisher(FLAGS.cloud_storage_bucket,
                                               gsutil_path=FLAGS.gsutil_path))
+    if FLAGS.csv_path:
+      publishers.append(CSVPublisher(FLAGS.csv_path))
 
     return publishers
 

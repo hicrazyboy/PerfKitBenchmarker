@@ -24,6 +24,10 @@ class Error(Exception):
 class Setup(object):
   """Errors raised in setting up PKB."""
 
+  class PythonPackageRequirementUnfulfilled(Error):
+    """Error raised when a Python package requirement is unfulfilled."""
+    pass
+
   class MissingExecutableError(Error):
     """Error raised when we cannot find an executable we need."""
     pass
@@ -45,6 +49,10 @@ class VirtualMachine(object):
     pass
 
   class RemoteExceptionError(Error):
+    pass
+
+  class AuthError(Error):
+    """Error raised when one VM cannot access another VM."""
     pass
 
   class VirtualMachineError(Error):
@@ -165,4 +173,13 @@ class Config(object):
 
   class UnrecognizedOption(Error):
     """User provided a value for an unrecognized config option."""
+    pass
+
+
+class Juju(object):
+  """Errors related to the Juju OS_TYPE."""
+  class TimeoutException(Error):
+    pass
+
+  class UnitErrorException(Error):
     pass

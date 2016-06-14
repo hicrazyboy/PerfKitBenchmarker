@@ -34,11 +34,13 @@ import re
 import threading
 import time
 import uuid
+import yaml
 
 from perfkitbenchmarker import disk
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import linux_packages
+from perfkitbenchmarker import os_types
 from perfkitbenchmarker import virtual_machine
 from perfkitbenchmarker import vm_util
 
@@ -55,6 +57,9 @@ DEFAULT_SSH_PORT = 22
 REMOTE_KEY_PATH = '.ssh/id_rsa'
 CONTAINER_MOUNT_DIR = '/mnt'
 CONTAINER_WORK_DIR = '/root'
+
+BACKGROUND_IPERF_PORT = 20001
+BACKGROUND_IPERF_SECONDS = 2147483647
 
 # This pair of scripts used for executing long-running commands, which will be
 # resilient in the face of SSH connection errors.
@@ -150,7 +155,7 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
                     '--delete']
     try:
       return self.RemoteCommand(' '.join(wait_command), should_log=should_log)
-    except:
+    except errors.VirtualMachine.RemoteCommandError:
       # In case the error was with the wrapper script itself, print the log.
       stdout, _ = self.RemoteCommand('cat %s' % wrapper_log, should_log=False)
       if stdout.strip():
@@ -248,13 +253,16 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
   @vm_util.Retry()
   def FormatDisk(self, device_path):
     """Formats a disk attached to the VM."""
-    fmt_cmd = ('sudo mke2fs -F -E lazy_itable_init=0 -O '
+    # Some images may automount one local disk, but we don't
+    # want to fail if this wasn't the case.
+    fmt_cmd = ('[[ -d /mnt ]] && sudo umount /mnt; '
+               'sudo mke2fs -F -E lazy_itable_init=0,discard -O '
                '^has_journal -t ext4 -b 4096 %s' % device_path)
     self.RemoteHostCommand(fmt_cmd)
 
   def MountDisk(self, device_path, mount_path):
     """Mounts a formatted disk in the VM."""
-    mnt_cmd = ('sudo mkdir -p {1};sudo mount {0} {1};'
+    mnt_cmd = ('sudo mkdir -p {1};sudo mount -o discard {0} {1};'
                'sudo chown -R $USER:$USER {1};').format(device_path, mount_path)
     self.RemoteHostCommand(mnt_cmd)
 
@@ -380,9 +388,7 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
       remote_path: The destination of the file on the TARGET machine, default
           is the home directory.
     """
-    if not self.has_private_key:
-      self.RemoteHostCopy(target.ssh_private_key, REMOTE_KEY_PATH)
-      self.has_private_key = True
+    self.AuthenticateVm()
 
     # TODO(user): For security we may want to include
     #     -o UserKnownHostsFile=/dev/null in the scp command
@@ -397,9 +403,31 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
 
   def AuthenticateVm(self):
     """Authenticate a remote machine to access all peers."""
-    self.RemoteHostCopy(vm_util.GetPrivateKeyPath(),
-                        REMOTE_KEY_PATH)
-    self.has_private_key = True
+    if not self.is_static and not self.has_private_key:
+      self.RemoteHostCopy(vm_util.GetPrivateKeyPath(),
+                          REMOTE_KEY_PATH)
+      with vm_util.NamedTemporaryFile() as tf:
+        tf.write('Host *\n')
+        tf.write('  StrictHostKeyChecking no\n')
+        tf.close()
+        self.PushFile(tf.name, '~/.ssh/config')
+
+      self.has_private_key = True
+
+  def TestAuthentication(self, peer):
+    """Tests whether the VM can access its peer.
+
+    Raises:
+      AuthError: If the VM cannot access its peer.
+    """
+    try:
+      self.RemoteCommand('ssh %s hostname' % peer.internal_ip)
+    except errors.VirtualMachine.RemoteCommandError:
+      raise errors.VirtualMachine.AuthError(
+          'Authentication check failed. If you are running with Static VMs, '
+          'please make sure that %s can ssh into %s without supplying any '
+          'arguments except the ip address.' % (self, peer))
+
 
   def CheckJavaVersion(self):
     """Check the version of java on remote machine.
@@ -467,9 +495,7 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
 
   def SetupLocalDisks(self):
     """Performs Linux specific setup of local disks."""
-    # Some images may automount one local disk, but we don't
-    # want to fail if this wasn't the case.
-    self.RemoteHostCommand('sudo umount /mnt', ignore_failure=True)
+    pass
 
   def _CreateScratchDiskFromDisks(self, disk_spec, disks):
     """Helper method to prepare data disks.
@@ -524,7 +550,6 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
     """Burns vm cpu for some amount of time and dirty cache.
 
     Args:
-      vm: The target vm.
       burn_cpu_threads: Number of threads to burn cpu.
       burn_cpu_seconds: Amount of time in seconds to burn cpu.
     """
@@ -540,11 +565,52 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
         time.sleep(end_time - time.time())
       self.RemoteCommand('pkill -9 sysbench')
 
+  def PrepareBackgroundWorkload(self):
+    """Install packages needed for the background workload."""
+    if self.background_cpu_threads:
+      self.Install('sysbench')
+    if self.background_network_mbits_per_sec:
+      self.Install('iperf')
+
+  def StartBackgroundWorkload(self):
+    """Starts the blackground workload."""
+    if self.background_cpu_threads:
+      self.RemoteCommand(
+          'nohup sysbench --num-threads=%s --test=cpu --cpu-max-prime=10000000 '
+          'run 1> /dev/null 2> /dev/null &' % self.background_cpu_threads)
+    if self.background_network_mbits_per_sec:
+      self.AllowPort(BACKGROUND_IPERF_PORT)
+      self.RemoteCommand('nohup iperf --server --port %s &> /dev/null &' %
+                         BACKGROUND_IPERF_PORT)
+      stdout, _ = self.RemoteCommand('pgrep iperf -n')
+      self.server_pid = stdout.strip()
+
+      if self.background_network_ip_type == vm_util.IpAddressSubset.EXTERNAL:
+        ip_address = self.ip_address
+      else:
+        ip_address = self.internal_ip
+      iperf_cmd = ('nohup iperf --client %s --port %s --time %s -u -b %sM '
+                   '&> /dev/null &' % (ip_address, BACKGROUND_IPERF_PORT,
+                                       BACKGROUND_IPERF_SECONDS,
+                                       self.background_network_mbits_per_sec))
+
+      self.RemoteCommand(iperf_cmd)
+      stdout, _ = self.RemoteCommand('pgrep iperf -n')
+      self.client_pid = stdout.strip()
+
+  def StopBackgroundWorkload(self):
+    """Stops the background workload."""
+    if self.background_cpu_threads:
+      self.RemoteCommand('pkill -9 sysbench')
+    if self.background_network_mbits_per_sec:
+      self.RemoteCommand('kill -9 ' + self.client_pid)
+      self.RemoteCommand('kill -9 ' + self.server_pid)
+
 
 class RhelMixin(BaseLinuxMixin):
   """Class holding RHEL specific VM methods and attributes."""
 
-  OS_TYPE = 'rhel'
+  OS_TYPE = os_types.RHEL
 
   def OnStartup(self):
     """Eliminates the need to have a tty to run sudo commands."""
@@ -645,12 +711,22 @@ class RhelMixin(BaseLinuxMixin):
 class DebianMixin(BaseLinuxMixin):
   """Class holding Debian specific VM methods and attributes."""
 
-  OS_TYPE = 'debian'
+  OS_TYPE = os_types.DEBIAN
 
+<<<<<<< HEAD
   def SetupPackageManager(self):
     """Runs apt-get update so InstallPackages shouldn't need to."""
     # self.AptUpdate()
     pass
+=======
+  def __init__(self, *args, **kwargs):
+    super(DebianMixin, self).__init__(*args, **kwargs)
+
+    # Whether or not apt-get update has been called.
+    # We defer running apt-get update until the first request to install a
+    # package.
+    self._apt_updated = False
+>>>>>>> ee0276d4a108ce7867e16fa3357cc990d9d6a103
 
   @vm_util.Retry(max_retries=UPDATE_RETRIES)
   def AptUpdate(self):
@@ -702,6 +778,11 @@ class DebianMixin(BaseLinuxMixin):
     """Installs a PerfKit package on the VM."""
     if not self.install_packages:
       return
+
+    if not self._apt_updated:
+      self.AptUpdate()
+      self._apt_updated = True
+
     if package_name not in self._installed_packages:
       package = linux_packages.PACKAGES[package_name]
       package.AptInstall(self)
@@ -760,7 +841,7 @@ class ContainerizedDebianMixin(DebianMixin):
   whereas any call to RemoteHostCommand() will be run in the VM itself.
   """
 
-  OS_TYPE = 'ubuntu_container'
+  OS_TYPE = os_types.UBUNTU_CONTAINER
 
   def _CheckDockerExists(self):
     """Returns whether docker is installed or not."""
@@ -855,6 +936,9 @@ class ContainerizedDebianMixin(DebianMixin):
       command = 'cp %s %s' % (container_path, destination_path)
       self.RemoteCommand(command)
 
+  @vm_util.Retry(
+      poll_interval=1, max_retries=3,
+      retryable_exceptions=(errors.VirtualMachine.RemoteCommandError,))
   def RemoteCopy(self, file_path, remote_path='', copy_to=True):
     """Copies a file to or from the container in the remote VM.
 
@@ -898,3 +982,215 @@ class ContainerizedDebianMixin(DebianMixin):
 
     # Copies the file to its final destination in the container
     target.ContainerCopy(file_name, remote_path)
+
+
+class JujuMixin(DebianMixin):
+  """Class to allow running Juju-deployed workloads.
+
+  Bootstraps a Juju environment using the manual provider:
+  https://jujucharms.com/docs/stable/config-manual
+  """
+
+  # TODO: Add functionality to tear down and uninstall Juju
+  # (for pre-provisioned) machines + JujuUninstall for packages using charms.
+
+  OS_TYPE = os_types.JUJU
+
+  is_controller = False
+
+  # A reference to the juju controller, useful when operations occur against
+  # a unit's VM but need to be preformed from the controller.
+  controller = None
+
+  vm_group = None
+
+  machines = {}
+  units = []
+
+  installation_lock = threading.Lock()
+
+  environments_yaml = """
+  default: perfkit
+
+  environments:
+      perfkit:
+          type: manual
+          bootstrap-host: {0}
+  """
+
+  def _Bootstrap(self):
+    """Bootstrap a Juju environment."""
+    resp, _ = self.RemoteHostCommand('juju bootstrap')
+
+  def JujuAddMachine(self, unit):
+    """Adds a manually-created virtual machine to Juju.
+
+    Args:
+      unit: An object representing the unit's BaseVirtualMachine.
+    """
+    resp, _ = self.RemoteHostCommand('juju add-machine ssh:%s' %
+                                     unit.internal_ip)
+
+    # We don't know what the machine's going to be used for yet,
+    # but track it's placement for easier access later.
+    # We're looking for the output: created machine %d
+    machine_id = _[_.rindex(' '):].strip()
+    self.machines[machine_id] = unit
+
+  def JujuConfigureEnvironment(self):
+    """Configure a bootstrapped Juju environment."""
+    if self.is_controller:
+      resp, _ = self.RemoteHostCommand('mkdir -p ~/.juju')
+
+      with vm_util.NamedTemporaryFile() as tf:
+        tf.write(self.environments_yaml.format(self.internal_ip))
+        tf.close()
+        self.PushFile(tf.name, '~/.juju/environments.yaml')
+
+  def JujuEnvironment(self):
+    """Get the name of the current environment."""
+    output, _ = self.RemoteHostCommand('juju switch')
+    return output.strip()
+
+  def JujuRun(self, cmd):
+    """Run a command on the virtual machine.
+
+    Args:
+      cmd: The command to run.
+    """
+    output, _ = self.RemoteHostCommand(cmd)
+    return output.strip()
+
+  def JujuStatus(self, pattern=''):
+    """Return the status of the Juju environment.
+
+    Args:
+      pattern: Optionally match machines/services with a pattern.
+    """
+    output, _ = self.RemoteHostCommand('juju status %s --format=json' %
+                                       pattern)
+    return output.strip()
+
+  def JujuVersion(self):
+    """Return the Juju version."""
+    output, _ = self.RemoteHostCommand('juju version')
+    return output.strip()
+
+  def JujuSet(self, service, params=[]):
+    """Set the configuration options on a deployed service.
+
+    Args:
+      service: The name of the service.
+      params: A list of key=values pairs.
+    """
+    output, _ = self.RemoteHostCommand(
+        'juju set %s %s' % (service, ' '.join(params)))
+    return output.strip()
+
+  @vm_util.Retry(poll_interval=30, timeout=3600)
+  def JujuWait(self):
+    """Wait for all deployed services to be installed, configured, and idle."""
+    status = yaml.load(self.JujuStatus())
+    for service in status['services']:
+      ss = status['services'][service]['service-status']['current']
+
+      # Accept blocked because the service may be waiting on relation
+      if ss not in ['active', 'unknown']:
+          raise errors.Juju.TimeoutException(
+              'Service %s is not ready; status is %s' % (service, ss))
+
+      if ss in ['error']:
+        # The service has failed to deploy.
+        debuglog = self.JujuRun('juju debug-log --limit 200')
+        logging.warn(debuglog)
+        raise errors.Juju.UnitErrorException(
+            'Service %s is in an error state' % service)
+
+      for unit in status['services'][service]['units']:
+        unit_data = status['services'][service]['units'][unit]
+        ag = unit_data['agent-state']
+        if ag != 'started':
+          raise errors.Juju.TimeoutException(
+              'Service %s is not ready; agent-state is %s' % (service, ag))
+
+        ws = unit_data['workload-status']['current']
+        if ws not in ['active', 'unknown']:
+          raise errors.Juju.TimeoutException(
+              'Service %s is not ready; workload-state is %s' % (service, ws))
+
+  def JujuDeploy(self, charm, vm_group):
+    """Deploy (and scale) this service to the machines in its vm group.
+
+    Args:
+      charm: The charm to deploy, i.e., cs:trusty/ubuntu.
+      vm_group: The name of vm_group the unit(s) should be deployed to.
+    """
+
+    # Find the already-deployed machines belonging to this vm_group
+    machines = []
+    for machine_id, unit in self.machines.iteritems():
+      if unit.vm_group == vm_group:
+        machines.append(machine_id)
+
+    # Deploy the first machine
+    resp, _ = self.RemoteHostCommand(
+        'juju deploy %s --to %s' % (charm, machines.pop()))
+
+    # Get the name of the service
+    service = charm[charm.rindex('/') + 1:]
+
+    # Deploy to the remaining machine(s)
+    for machine in machines:
+      resp, _ = self.RemoteHostCommand(
+          'juju add-unit %s --to %s' % (service, machine))
+
+  def JujuRelate(self, service1, service2):
+    """Create a relation between two services.
+
+    Args:
+      service1: The first service to relate.
+      service2: The second service to relate.
+    """
+    resp, _ = self.RemoteHostCommand(
+        'juju add-relation %s %s' % (service1, service2))
+
+  def Install(self, package_name):
+    """Installs a PerfKit package on the VM."""
+    package = linux_packages.PACKAGES[package_name]
+    try:
+      # Make sure another unit doesn't try
+      # to install the charm at the same time
+      with self.controller.installation_lock:
+        if package_name not in self.controller._installed_packages:
+          package.JujuInstall(self.controller, self.vm_group)
+          self.controller._installed_packages.add(package_name)
+    except AttributeError as e:
+      logging.warn('Failed to install package %s, falling back to Apt (%s)'
+                   % (package_name, e))
+      if package_name not in self._installed_packages:
+        package.AptInstall(self)
+        self._installed_packages.add(package_name)
+
+  def SetupPackageManager(self):
+    if self.is_controller:
+      resp, _ = self.RemoteHostCommand(
+          'sudo add-apt-repository ppa:juju/stable'
+      )
+    super(JujuMixin, self).SetupPackageManager()
+
+  def PrepareVMEnvironment(self):
+    """Install and configure a Juju environment."""
+    super(JujuMixin, self).PrepareVMEnvironment()
+    if self.is_controller:
+      self.InstallPackages('juju')
+
+      self.JujuConfigureEnvironment()
+
+      self.AuthenticateVm()
+
+      self._Bootstrap()
+
+      # Install the Juju agent on the other VMs
+      for unit in self.units:
+        unit.controller = self
+        self.JujuAddMachine(unit)

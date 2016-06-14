@@ -14,13 +14,9 @@
 
 """Set of utility functions for working with virtual machines."""
 
-from collections import namedtuple
-from concurrent import futures
 import contextlib
-import functools
 import logging
 import os
-import Queue
 import random
 import re
 import string
@@ -28,23 +24,20 @@ import subprocess
 import tempfile
 import threading
 import time
-import traceback
 
 import jinja2
 
-from perfkitbenchmarker import context
+from perfkitbenchmarker import background_tasks
 from perfkitbenchmarker import data
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
-from perfkitbenchmarker import log_util
-from perfkitbenchmarker import regex_util
+from perfkitbenchmarker import temp_dir
 
 FLAGS = flags.FLAGS
 
 PRIVATE_KEYFILE = 'perfkitbenchmarker_keyfile'
 PUBLIC_KEYFILE = 'perfkitbenchmarker_keyfile.pub'
 CERT_FILE = 'perfkitbenchmarker.pem'
-TEMP_DIR = os.path.join(tempfile.gettempdir(), 'perfkitbenchmarker')
 
 # The temporary directory on VMs. We cannot reuse GetTempDir()
 # because run_uri will not be available at time of module load and we need
@@ -70,8 +63,17 @@ OUTPUT_EXIT_CODE = 2
 flags.DEFINE_integer('default_timeout', TIMEOUT, 'The default timeout for '
                      'retryable commands in seconds.')
 flags.DEFINE_integer('burn_cpu_seconds', 0,
-                     'Amount of time in seconds to burn cpu on vm.')
-flags.DEFINE_integer('burn_cpu_threads', 1, 'Number of threads to burn cpu.')
+                     'Amount of time in seconds to burn cpu on vm before '
+                     'starting benchmark')
+flags.DEFINE_integer('burn_cpu_threads', 1, 'Number of threads to use to '
+                     'burn cpu before starting benchmark.')
+flags.DEFINE_integer('background_cpu_threads', None,
+                     'Number of threads of background cpu usage while '
+                     'running a benchmark')
+flags.DEFINE_integer('background_network_mbits_per_sec', None,
+                     'Number of megabits per second of background '
+                     'network traffic to generate during the run phase '
+                     'of the benchmark')
 
 
 class IpAddressSubset(object):
@@ -90,21 +92,25 @@ flags.DEFINE_enum('ip_addresses', IpAddressSubset.REACHABLE,
                   'the receiving VM is reachable by internal IP (REACHABLE), '
                   'external IP only (EXTERNAL) or internal IP only (INTERNAL)')
 
+flags.DEFINE_enum('background_network_ip_type', IpAddressSubset.EXTERNAL,
+                  (IpAddressSubset.INTERNAL, IpAddressSubset.EXTERNAL),
+                  'IP address type to use when generating background network '
+                  'traffic')
+
 
 def GetTempDir():
   """Returns the tmp dir of the current run."""
-  return os.path.join(TEMP_DIR, 'run_{0}'.format(FLAGS.run_uri))
+  return temp_dir.GetRunDirPath()
 
 
 def PrependTempDir(file_name):
   """Returns the file name prepended with the tmp dir of the current run."""
-  return '%s/%s' % (GetTempDir(), file_name)
+  return os.path.join(GetTempDir(), file_name)
 
 
 def GenTempDir():
   """Creates the tmp dir for the current run if it does not already exist."""
-  if not os.path.exists(GetTempDir()):
-    os.makedirs(GetTempDir())
+  temp_dir.CreateTemporaryDirectories()
 
 
 def SSHKeyGen():
@@ -174,248 +180,15 @@ def GetSshOptions(ssh_key_filename):
       '-i', ssh_key_filename
   ]
   options.extend(FLAGS.ssh_options)
-  if FLAGS.log_level == 'debug':
-    options.append('-v')
 
   return options
 
 
-def _GetCallString(target_arg_tuple):
-  """Returns the string representation of a function call."""
-  target, args, kwargs = target_arg_tuple
-  while isinstance(target, functools.partial):
-    args = target.args + args
-    inner_kwargs = target.keywords.copy()
-    inner_kwargs.update(kwargs)
-    kwargs = inner_kwargs
-    target = target.func
-  arg_strings = [str(a) for a in args]
-  arg_strings.extend(['{0}={1}'.format(k, v) for k, v in kwargs.iteritems()])
-  return '{0}({1})'.format(getattr(target, '__name__', target),
-                           ', '.join(arg_strings))
-
-
-# Result of a call executed by RunParallelThreads.
-#
-# Attributes:
-#   call_id: int. Index corresponding to the call in the target_arg_tuples
-#       argument of RunParallelThreads.
-#   return_value: Return value if the call was executed successfully, or None if
-#       an exception was raised.
-#   traceback: None if the call was executed successfully, or the traceback
-#       string if the call raised an exception.
-ThreadCallResult = namedtuple('ThreadCallResult', [
-    'call_id', 'return_value', 'traceback'])
-
-
-def _ExecuteThreadCall(target_arg_tuple, call_id, queue, parent_log_context,
-                       parent_benchmark_spec):
-  """Function invoked in another thread by RunParallelThreads.
-
-  Executes a specified function call and captures the traceback upon exception.
-
-  Args:
-    target_arg_tuple: (target, args, kwargs) tuple containing the function to
-        call and the arguments to pass it.
-    call_id: int. Index corresponding to the call in the thread_params argument
-        of RunParallelThreads.
-    queue: Queue. Receives a ThreadCallResult.
-    parent_log_context: ThreadLogContext of the parent thread.
-    parent_benchmark_spec: BenchmarkSpec of the parent thread.
-  """
-  target, args, kwargs = target_arg_tuple
-  try:
-    log_context = log_util.ThreadLogContext(parent_log_context)
-    log_util.SetThreadLogContext(log_context)
-    context.SetThreadBenchmarkSpec(parent_benchmark_spec)
-    queue.put(ThreadCallResult(call_id, target(*args, **kwargs), None))
-  except:
-    queue.put(ThreadCallResult(call_id, None, traceback.format_exc()))
-
-
-def RunParallelThreads(target_arg_tuples, max_concurrency):
-  """Executes function calls concurrently in separate threads.
-
-  Args:
-    target_arg_tuples: list of (target, args, kwargs) tuples. Each tuple
-        contains the function to call and the arguments to pass it.
-    max_concurrency: int or None. The maximum number of concurrent new
-        threads.
-
-  Returns:
-    list of function return values in the order corresponding to the order of
-    target_arg_tuples.
-
-  Raises:
-    errors.VmUtil.ThreadException: When an exception occurred in any of the
-        called functions.
-  """
-  queue = Queue.Queue()
-  log_context = log_util.GetThreadLogContext()
-  benchmark_spec = context.GetThreadBenchmarkSpec()
-  max_concurrency = min(max_concurrency, len(target_arg_tuples))
-  results = [None] * len(target_arg_tuples)
-  error_strings = []
-  for call_id in xrange(max_concurrency):
-    target_arg_tuple = target_arg_tuples[call_id]
-    thread = threading.Thread(
-        target=_ExecuteThreadCall,
-        args=(target_arg_tuple, call_id, queue, log_context, benchmark_spec))
-    thread.daemon = True
-    thread.start()
-  active_thread_count = max_concurrency
-  next_call_id = max_concurrency
-  while active_thread_count:
-    try:
-      # Using a timeout makes this wait interruptable.
-      call_id, result, stacktrace = queue.get(block=True, timeout=1000)
-    except Queue.Empty:
-      continue
-    results[call_id] = result
-    if stacktrace:
-      msg = ('Exception occurred while calling {0}:{1}{2}'.format(
-          _GetCallString(target_arg_tuples[call_id]), os.linesep, stacktrace))
-      logging.error(msg)
-      error_strings.append(msg)
-    if next_call_id == len(target_arg_tuples):
-      active_thread_count -= 1
-    else:
-      target_arg_tuple = target_arg_tuples[next_call_id]
-      thread = threading.Thread(
-          target=_ExecuteThreadCall,
-          args=(target_arg_tuple, next_call_id, queue, log_context,
-                benchmark_spec))
-      thread.daemon = True
-      thread.start()
-      next_call_id += 1
-  if error_strings:
-    raise errors.VmUtil.ThreadException(
-        'The following exceptions occurred during threaded execution:'
-        '{0}{1}'.format(os.linesep, os.linesep.join(error_strings)))
-  return results
-
-
-def RunThreaded(target, thread_params, max_concurrent_threads=200):
-  """Runs the target method in parallel threads.
-
-  The method starts up threads with one arg from thread_params as the first arg.
-
-  Args:
-    target: The method to invoke in the thread.
-    thread_params: A thread is launched for each value in the list. The items
-        in the list can either be a singleton or a (args, kwargs) tuple/list.
-        Usually this is a list of VMs.
-    max_concurrent_threads: The maximum number of concurrent threads to allow.
-
-  Returns:
-    List of the same length as thread_params. Contains the return value from
-    each threaded function call in the corresponding order as thread_params.
-
-  Raises:
-    ValueError: when thread_params is not valid.
-    errors.VmUtil.ThreadException: When an exception occurred in any of the
-        called functions.
-
-  Example 1: # no args other than list.
-    args = [self.CreateVm()
-            for x in range(0, 10)]
-    RunThreaded(MyThreadedTargetMethod, args)
-
-  Example 2: # using args only to pass to the thread:
-    args = [((self.CreateVm(), i, 'somestring'), {})
-            for i in range(0, 10)]
-    RunThreaded(MyThreadedTargetMethod, args)
-
-  Example 3: # using args & kwargs to pass to the thread:
-    args = [((self.CreateVm(),), {'num': i, 'name': 'somestring'})
-            for i in range(0, 10)]
-    RunThreaded(MyThreadedTargetMethod, args)
-  """
-  if not isinstance(thread_params, list):
-    raise ValueError('Param "thread_params" must be a list')
-
-  if not thread_params:
-    # Nothing to do.
-    return []
-
-  if not isinstance(thread_params[0], tuple):
-    target_arg_tuples = [(target, (arg,), {}) for arg in thread_params]
-  elif (not isinstance(thread_params[0][0], tuple) or
-        not isinstance(thread_params[0][1], dict)):
-    raise ValueError('If Param is a tuple, the tuple must be (tuple, dict)')
-  else:
-    target_arg_tuples = [(target, args, kwargs)
-                         for args, kwargs in thread_params]
-
-  return RunParallelThreads(target_arg_tuples, max_concurrent_threads)
-
-
-def _ExecuteProcCall(target_arg_tuple):
-  """Function invoked in another process by RunParallelProcesses.
-
-  Executes a specified function call and captures the traceback upon exception.
-  TODO(skschneider): Remove this helper function when moving to Python 3.5 or
-  when the backport of concurrent.futures.ProcessPoolExecutor is able to
-  preserve original traceback.
-
-  Args:
-    target_arg_tuple: (target, args, kwargs) tuple containing the function to
-        call and the arguments to pass it.
-
-  Returns:
-    (result, traceback) tuple. The first element is the return value from the
-    called function, or None if the function raised an exception. The second
-    element is the exception traceback string, or None if the function
-    succeeded.
-  """
-  target, args, kwargs = target_arg_tuple
-  try:
-    return target(*args, **kwargs), None
-  except:
-    return None, traceback.format_exc()
-
-
-def RunParallelProcesses(target_arg_tuples, max_concurrency=None):
-  """Executes function calls concurrently in separate processes.
-
-  Args:
-    target_arg_tuples: list of (target, args, kwargs) tuples. Each tuple
-        contains the function to call and the arguments to pass it.
-    max_concurrency: int or None. The maximum number of concurrent new
-        processes. If None, it will default to the number of processors on the
-        machine.
-
-  Returns:
-    list of function return values in the order corresponding to the order of
-    target_arg_tuples.
-
-  Raises:
-    errors.VmUtil.CalledProcessException: When an exception occurred in any
-        of the called functions.
-  """
-  call_futures = []
-  results = []
-  error_strings = []
-  with futures.ProcessPoolExecutor(max_workers=max_concurrency) as executor:
-    for target_arg_tuple in target_arg_tuples:
-      call_futures.append(executor.submit(_ExecuteProcCall, target_arg_tuple))
-    for index, future in enumerate(call_futures):
-      try:
-        result, stacktrace = future.result()
-      except:
-        result = None
-        stacktrace = traceback.format_exc()
-      results.append(result)
-      if stacktrace:
-        msg = ('Exception occurred while calling {0}:{1}{2}'.format(
-            _GetCallString(target_arg_tuples[index]), os.linesep, stacktrace))
-        logging.error(msg)
-        error_strings.append(msg)
-  if error_strings:
-    msg = ('The following exceptions occurred during parallel execution:'
-           '{0}{1}'.format(os.linesep, os.linesep.join(error_strings)))
-    raise errors.VmUtil.CalledProcessException(msg)
-  return results
+# TODO(skschneider): Remove at least RunParallelProcesses and RunParallelThreads
+# from this file (update references to call directly into background_tasks).
+RunParallelProcesses = background_tasks.RunParallelProcesses
+RunParallelThreads = background_tasks.RunParallelThreads
+RunThreaded = background_tasks.RunThreaded
 
 
 def Retry(poll_interval=POLL_INTERVAL, max_retries=MAX_RETRIES,
@@ -510,25 +283,28 @@ def IssueCommand(cmd, force_info_log=False, suppress_warning=False,
   logging.info('Running: %s', full_cmd)
 
   shell_value = RunningOnWindows()
-  process = subprocess.Popen(cmd, env=env, shell=shell_value,
-                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE)
+  with tempfile.TemporaryFile() as tf_out, tempfile.TemporaryFile() as tf_err:
+    process = subprocess.Popen(cmd, env=env, shell=shell_value,
+                               stdin=subprocess.PIPE, stdout=tf_out,
+                               stderr=tf_err)
 
-  def _KillProcess():
-    logging.error('IssueCommand timed out after %d seconds. '
-                  'Killing command "%s".', timeout, full_cmd)
-    process.kill()
+    def _KillProcess():
+      logging.error('IssueCommand timed out after %d seconds. '
+                    'Killing command "%s".', timeout, full_cmd)
+      process.kill()
 
-  timer = threading.Timer(timeout, _KillProcess)
-  timer.start()
+    timer = threading.Timer(timeout, _KillProcess)
+    timer.start()
 
-  try:
-    stdout, stderr = process.communicate(input)
-  finally:
-    timer.cancel()
+    try:
+      process.wait()
+    finally:
+      timer.cancel()
 
-  stdout = stdout.decode('ascii', 'ignore')
-  stderr = stderr.decode('ascii', 'ignore')
+    tf_out.seek(0)
+    stdout = tf_out.read().decode('ascii', 'ignore')
+    tf_err.seek(0)
+    stderr = tf_err.read().decode('ascii', 'ignore')
 
   debug_text = ('Ran %s. Got return code (%s).\nSTDOUT: %s\nSTDERR: %s' %
                 (full_cmd, process.returncode, stdout, stderr))
@@ -627,16 +403,20 @@ def ShouldRunOnInternalIpAddress(sending_vm, receiving_vm):
 
 def GetLastRunUri():
   """Returns the last run_uri used (or None if it can't be determined)."""
-  if RunningOnWindows():
-    cmd = ['powershell', '-Command',
-           'gci %s | sort LastWriteTime | select -last 1' % TEMP_DIR]
-  else:
-    cmd = ['bash', '-c', 'ls -1t %s | head -1' % TEMP_DIR]
-  stdout, _, _ = IssueCommand(cmd)
+  runs_dir_path = temp_dir.GetAllRunsDirPath()
   try:
-    return regex_util.ExtractGroup('run_([^\s]*)', stdout)
-  except regex_util.NoMatchError:
+    dir_names = next(os.walk(runs_dir_path))[1]
+  except StopIteration:
+    # The runs directory was not found.
     return None
+
+  if not dir_names:
+    # No run subdirectories were found in the runs directory.
+    return None
+
+  # Return the subdirectory with the most recent modification time.
+  return max(dir_names,
+             key=lambda d: os.path.getmtime(os.path.join(runs_dir_path, d)))
 
 
 @contextlib.contextmanager
@@ -661,18 +441,19 @@ def NamedTemporaryFile(prefix='tmp', suffix='', dir=None, delete=True):
       os.unlink(f.name)
 
 
-def GenerateSSHConfig(benchmark_spec):
-  """Generates an SSH config file to simplify connecting to "vms".
+def GenerateSSHConfig(vms, vm_groups):
+  """Generates an SSH config file to simplify connecting to the specified VMs.
 
-  Writes a file to GetTempDir()/ssh_config with SSH configuration for each VM in
-  'vms'.  Users can then SSH with any of the following:
+  Writes a file to GetTempDir()/ssh_config with an SSH configuration for each VM
+  provided in the arguments. Users can then SSH with any of the following:
 
       ssh -F <ssh_config_path> <vm_name>
       ssh -F <ssh_config_path> vm<vm_index>
       ssh -F <ssh_config_path> <group_name>-<index>
 
   Args:
-    benchmark_spec: Benchmark specification.
+    vms: list of BaseVirtualMachines.
+    vm_groups: dict mapping VM group name string to list of BaseVirtualMachines.
   """
   target_file = os.path.join(GetTempDir(), 'ssh_config')
   template_path = data.ResourcePath('ssh_config.j2')
@@ -680,8 +461,7 @@ def GenerateSSHConfig(benchmark_spec):
   with open(template_path) as fp:
     template = environment.from_string(fp.read())
   with open(target_file, 'w') as ofp:
-    ofp.write(template.render({'vms': benchmark_spec.vms,
-                               'vm_groups': benchmark_spec.vm_groups}))
+    ofp.write(template.render({'vms': vms, 'vm_groups': vm_groups}))
 
   ssh_options = ['  ssh -F {0} {1}'.format(target_file, pattern)
                  for pattern in ('<vm_name>', 'vm<index>',
@@ -718,7 +498,7 @@ def GenerateRandomWindowsPassword(password_length=PASSWORD_LENGTH):
   # special characters. This greatly limits the set of characters
   # that we can safely use. See
   # https://github.com/Azure/azure-xplat-cli/blob/master/lib/commands/arm/vm/vmOsProfile._js#L145
-  special_chars = '*!@#$%^+='
+  special_chars = '*!@#$%+='
   password = [
       random.choice(string.ascii_letters + string.digits + special_chars)
       for _ in range(password_length - 4)]

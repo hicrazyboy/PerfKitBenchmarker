@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ntpath
 import os
 import time
 
 from perfkitbenchmarker import disk
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
+from perfkitbenchmarker import os_types
 from perfkitbenchmarker import virtual_machine
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker import windows_packages
@@ -36,7 +38,7 @@ STARTUP_SCRIPT = ('powershell -Command "Enable-PSRemoting -force; '
 
 class WindowsMixin(virtual_machine.BaseOsMixin):
 
-  OS_TYPE = 'windows'
+  OS_TYPE = os_types.WINDOWS
 
   def __init__(self):
     super(WindowsMixin, self).__init__()
@@ -107,7 +109,7 @@ class WindowsMixin(virtual_machine.BaseOsMixin):
     Raises:
       RemoteCommandError: If there was a problem copying the file.
     """
-    drive, remote_path = os.path.splitdrive(remote_path)
+    drive, remote_path = ntpath.splitdrive(remote_path)
     drive = (drive or self.system_drive).rstrip(':')
 
     set_error_pref = '$ErrorActionPreference="Stop"'
@@ -157,7 +159,7 @@ class WindowsMixin(virtual_machine.BaseOsMixin):
 
   def OnStartup(self):
     stdout, _ = self.RemoteCommand('echo $env:TEMP')
-    self.temp_dir = os.path.join(stdout.strip(), 'pkb')
+    self.temp_dir = ntpath.join(stdout.strip(), 'pkb')
     stdout, _ = self.RemoteCommand('echo $env:SystemDrive')
     self.system_drive = stdout.strip()
     self.RemoteCommand('mkdir %s' % self.temp_dir)
@@ -193,11 +195,16 @@ class WindowsMixin(virtual_machine.BaseOsMixin):
     """Returns the number of logical CPUs on the VM.
 
     This method does not cache results (unlike "num_cpus").
+
+    Returns:
+      int. Number of logical CPUs.
     """
     stdout, _ = self.RemoteCommand(
         'Get-WmiObject -class Win32_processor | '
-        'select -exp NumberOfLogicalProcessors')
-    return int(stdout)
+        'Select-Object -ExpandProperty NumberOfLogicalProcessors')
+    # In the case that there are multiple Win32_processor instances, the result
+    # of this command can be a string like '4  4  '.
+    return sum(int(i) for i in stdout.split())
 
   def _GetTotalMemoryKb(self):
     """Returns the amount of physical memory on the VM in Kilobytes.
@@ -247,7 +254,7 @@ class WindowsMixin(virtual_machine.BaseOsMixin):
       tf.write(script)
       tf.close()
       self.RemoteCopy(tf.name, self.temp_dir)
-      script_path = os.path.join(self.temp_dir, os.path.basename(tf.name))
+      script_path = ntpath.join(self.temp_dir, os.path.basename(tf.name))
       self.RemoteCommand('diskpart /s {script_path}'.format(
           script_path=script_path))
 

@@ -35,6 +35,11 @@ flags.DEFINE_integer('iperf_sending_thread_count', 1,
 flags.DEFINE_integer('iperf_runtime_in_seconds', 60,
                      'Number of seconds to run iperf.',
                      lower_bound=1)
+flags.DEFINE_integer('iperf_timeout', None,
+                     'Number of seconds to wait in '
+                     'addition to iperf runtime before '
+                     'killing iperf client command.',
+                     lower_bound=1)
 
 FLAGS = flags.FLAGS
 
@@ -65,12 +70,19 @@ def Prepare(benchmark_spec):
         required to run the benchmark.
   """
   vms = benchmark_spec.vms
+  if len(vms) != 2:
+    raise ValueError(
+        'iperf benchmark requires exactly two machines, found {0}'.format(len(
+            vms)))
+
   for vm in vms:
     vm.Install('iperf')
     if vm_util.ShouldRunOnExternalIpAddress():
       vm.AllowPort(IPERF_PORT)
-    vm.RemoteCommand('nohup iperf --server --port %s &> /dev/null &' %
-                     IPERF_PORT)
+    stdout, _ = vm.RemoteCommand(('nohup iperf --server --port %s &> /dev/null'
+                                  '& echo $!') % IPERF_PORT)
+    # TODO store this in a better place once we have a better place
+    vm.iperf_server_pid = stdout.strip()
 
 
 @vm_util.Retry(max_retries=IPERF_RETRIES)
@@ -91,7 +103,7 @@ def _RunIperf(sending_vm, receiving_vm, receiving_ip_address, ip_type):
                 FLAGS.iperf_sending_thread_count))
   # the additional time on top of the iperf runtime is to account for the
   # time it takes for the iperf process to start and exit
-  timeout_buffer = 30 + FLAGS.iperf_sending_thread_count
+  timeout_buffer = FLAGS.iperf_timeout or 30 + FLAGS.iperf_sending_thread_count
   stdout, _ = sending_vm.RemoteCommand(iperf_cmd, should_log=True,
                                        timeout=FLAGS.iperf_runtime_in_seconds +
                                        timeout_buffer)
@@ -157,9 +169,7 @@ def Run(benchmark_spec):
   logging.info('Iperf Results:')
 
   # Send traffic in both directions
-  for originator in [0, 1]:
-    sending_vm = vms[originator]
-    receiving_vm = vms[originator ^ 1]
+  for sending_vm, receiving_vm in vms, reversed(vms):
     # Send using external IP addresses
     if vm_util.ShouldRunOnExternalIpAddress():
       results.append(_RunIperf(sending_vm,
@@ -186,4 +196,5 @@ def Cleanup(benchmark_spec):
         required to run the benchmark.
   """
   vms = benchmark_spec.vms
-  vms[1].RemoteCommand('pkill -9 iperf')
+  for vm in vms:
+    vm.RemoteCommand('kill -9 ' + vm.iperf_server_pid, ignore_failure=True)

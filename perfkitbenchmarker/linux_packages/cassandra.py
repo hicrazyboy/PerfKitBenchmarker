@@ -26,6 +26,8 @@ import time
 
 from perfkitbenchmarker import data
 from perfkitbenchmarker import errors
+from perfkitbenchmarker import flags
+from perfkitbenchmarker import os_types
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.linux_packages.ant import ANT_HOME_DIR
 
@@ -45,9 +47,11 @@ NODETOOL = posixpath.join(CASSANDRA_DIR, 'bin', 'nodetool')
 
 # Number of times to attempt to start the cluster.
 CLUSTER_START_TRIES = 10
-CLUSTER_START_SLEEP = 120
+CLUSTER_START_SLEEP = 60
 # Time, in seconds, to sleep between node starts.
-NODE_START_SLEEP = 30
+NODE_START_SLEEP = 5
+
+FLAGS = flags.FLAGS
 
 
 def CheckPrerequisites():
@@ -90,6 +94,40 @@ def AptInstall(vm):
   _Install(vm)
 
 
+def JujuInstall(vm, vm_group_name):
+  """Installs the Cassandra charm on the VM."""
+  vm.JujuDeploy('cs:trusty/cassandra', vm_group_name)
+
+  # The charm defaults to Cassandra 2.2.x, which has deprecated
+  # cassandra-cli. Specify the sources to downgrade to Cassandra 2.1.x
+  # to match the cassandra benchmark(s) expectations.
+  sources = ['deb http://www.apache.org/dist/cassandra/debian 21x main',
+             'ppa:openjdk-r/ppa',
+             'ppa:stub/cassandra']
+
+  keys = ['F758CE318D77295D',
+          'null',
+          'null']
+
+  vm.JujuSet('cassandra', [
+             # Allow authentication from all units
+             'authenticator=AllowAllAuthenticator',
+             'install_sources="[%s]"' %
+             ', '.join(map(lambda x: "'" + x + "'", sources)),
+             'install_keys="[%s]"'
+             % ', '.join(keys)
+             ])
+
+  # Wait for cassandra to be installed and configured
+  vm.JujuWait()
+
+  for unit in vm.units:
+    # Make sure the cassandra/conf dir is created, since we're skipping
+    # the manual installation to /tmp/pkb.
+    remote_path = posixpath.join(CASSANDRA_DIR, 'conf')
+    unit.RemoteCommand('mkdir -p %s' % remote_path)
+
+
 def Configure(vm, seed_vms):
   """Configure Cassandra on 'vm'.
 
@@ -117,6 +155,9 @@ def Start(vm):
   Args:
     vm: The target vm. Should already be configured via 'Configure'.
   """
+  if vm.OS_TYPE == os_types.JUJU:
+    return
+
   vm.RemoteCommand(
       'nohup {0}/bin/cassandra -p "{1}" 1> {2} 2> {3} &'.format(
           CASSANDRA_DIR, CASSANDRA_PID, CASSANDRA_OUT, CASSANDRA_ERR))
@@ -124,6 +165,9 @@ def Start(vm):
 
 def Stop(vm):
   """Stops Cassandra on 'vm'."""
+  if vm.OS_TYPE == os_types.JUJU:
+    return
+
   vm.RemoteCommand('kill $(cat {0})'.format(CASSANDRA_PID),
                    ignore_failure=True)
 
@@ -153,6 +197,9 @@ def CleanNode(vm):
   Args:
     vm: VirtualMachine. VM to clean.
   """
+  if vm.OS_TYPE == os_types.JUJU:
+    return
+
   data_path = posixpath.join(vm.GetScratchDir(), 'cassandra')
   vm.RemoteCommand('rm -rf {0}'.format(data_path))
 
@@ -162,6 +209,26 @@ def _StartCassandraIfNotRunning(vm):
   if not IsRunning(vm):
     logging.info('Retrying starting cassandra on %s', vm)
     Start(vm)
+
+
+def GetCassandraCliPath(vm):
+  if vm.OS_TYPE == os_types.JUJU:
+    # Replace the stock CASSANDRA_CLI so that it uses the binary
+    # installed by the cassandra charm.
+    return '/usr/bin/cassandra-cli'
+
+  return posixpath.join(CASSANDRA_DIR, 'bin',
+                        'cassandra-cli')
+
+
+def GetCassandraStressPath(vm):
+  if vm.OS_TYPE == os_types.JUJU:
+    # Replace the stock CASSANDRA_STRESS so that it uses the binary
+    # installed by the cassandra-stress charm.
+    return '/usr/bin/cassandra-stress'
+
+  return posixpath.join(CASSANDRA_DIR, 'tools', 'bin',
+                        'cassandra-stress')
 
 
 def GetNumberOfNodesUp(vm):
@@ -187,6 +254,11 @@ def StartCluster(seed_vm, vms):
     vms: list of VirtualMachines. VMs *other than* seed_vm which should be
       started.
   """
+
+  if seed_vm.OS_TYPE == os_types.JUJU:
+    # Juju automatically configures and starts the Cassandra cluster.
+    return
+
   vm_count = len(vms) + 1
 
   # Cassandra setup
@@ -205,6 +277,7 @@ def StartCluster(seed_vm, vms):
     raise ValueError('Cassandra failed to start on seed.')
 
   if vms:
+    logging.info('Starting remaining %d nodes', len(vms))
     # Start the VMs with a small pause in between each, to allow the node to
     # join.
     # Starting Cassandra nodes fails when multiple nodes attempt to join the
@@ -222,8 +295,8 @@ def StartCluster(seed_vm, vms):
       logging.info('All %d nodes up!', vm_count)
       break
 
-    logging.warn('Try %d: only %s of %s up. Sleeping %ds', i, vms_up,
-                 vm_count, NODE_START_SLEEP)
+    logging.warn('Try %d: only %s of %s up. Restarting and sleeping %ds', i,
+                 vms_up, vm_count, NODE_START_SLEEP)
     vm_util.RunThreaded(_StartCassandraIfNotRunning, vms)
     time.sleep(NODE_START_SLEEP)
   else:
