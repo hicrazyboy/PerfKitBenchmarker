@@ -22,263 +22,480 @@ for more information about Azure Virtual Networks.
 """
 
 import json
-import uuid
+import threading
 
+from perfkitbenchmarker import context
+from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import network
+from perfkitbenchmarker import providers
 from perfkitbenchmarker import resource
 from perfkitbenchmarker import vm_util
-from perfkitbenchmarker import providers
+from perfkitbenchmarker.providers import azure
 
 FLAGS = flags.FLAGS
-AZURE_PATH = 'azure'
-MAX_NAME_LENGTH = 24
 SSH_PORT = 22
-# We need to prefix storage account names so that VMs won't create their own
-# account upon creation.
-# See https://github.com/MSOpenTech/azure-xplat-cli/pull/349
-STORAGE_ACCOUNT_PREFIX = 'portalvhds'
+
+DEFAULT_LOCATION = 'eastus2'
 
 
-class _AzureEndpoint(resource.BaseResource):
-  """An object representing an endpoint to an Azure VM.
+def GetResourceGroup(zone=None):
+  """Get the resource group for the current benchmark."""
+  spec = context.GetThreadBenchmarkSpec()
+  # This is protected by spec.networks_lock, so there's no race
+  # condition with checking for the attribute and then creating a
+  # resource group.
+  try:
+    return spec.azure_resource_group
+  except AttributeError:
+    group = AzureResourceGroup(
+        'pkb%s-%s' % (FLAGS.run_uri, spec.uid), zone=zone)
+    spec.azure_resource_group = group
+    return group
 
-  No deletion is specified, as endpoints are deleted along with the VM.
-  """
-  def __init__(self, vm_name, port, protocol):
-    super(_AzureEndpoint, self).__init__()
-    self.vm_name = vm_name
-    self.port = port
-    self.protocol = protocol
+
+class AzureResourceGroup(resource.BaseResource):
+  """A Resource Group, the basic unit of Azure provisioning."""
+
+  def __init__(self, name, zone=None, use_existing=False, timeout_minutes=None):
+    super(AzureResourceGroup, self).__init__()
+    self.name = name
+    self.use_existing = use_existing
+    self.timeout_minutes = timeout_minutes
+    # A resource group's location doesn't affect the location of
+    # actual resources, but we need to choose *some* region for every
+    # benchmark, even if the user doesn't specify one.
+    self.location = (FLAGS.zones[0] if FLAGS.zones else
+                     zone or DEFAULT_LOCATION)
+    # Whenever an Azure CLI command needs a resource group, it's
+    # always specified the same way.
+    self.args = ['--resource-group', self.name]
 
   def _Create(self):
-    create_cmd = [AZURE_PATH,
-                  'vm',
-                  'endpoint',
-                  'create',
-                  self.vm_name,
-                  str(self.port),
-                  '--protocol=' + self.protocol]
-    vm_util.IssueCommand(create_cmd)
+    if not self.use_existing:
+      # A resource group can own resources in multiple zones, but the
+      # group itself needs to have a location. Therefore,
+      # FLAGS.zones[0].
+      _, _, retcode = vm_util.IssueCommand(
+          [azure.AZURE_PATH, 'group', 'create',
+           '--name', self.name,
+           '--location', self.location,
+           '--tags'] + self._GetTags())
+
+      if retcode:
+        raise errors.Resource.RetryableCreationError(
+            'Error creating Azure resource group')
 
   def _Exists(self):
-    """Returns whether or not an endpoint exists."""
-    # Example output:
-    # [
-    #   {
-    #     "localPort": 22,
-    #     "name": "ssh",
-    #     "port": 22,
-    #     "protocol": "tcp",
-    #     "virtualIPAddress": "104.43.224.13",
-    #     "enableDirectServerReturn": false
-    #   }
-    # ]
-    exists_cmd = [AZURE_PATH,
-                  'vm',
-                  'endpoint',
-                  'list',
-                  '--json',
-                  self.vm_name]
-    stdout, _, status = vm_util.IssueCommand(exists_cmd)
-    if status or stdout == 'No VMs found':
+    stdout, _, _ = vm_util.IssueCommand(
+        [azure.AZURE_PATH, 'group', 'show', '--name', self.name],
+        suppress_warning=True)
+    try:
+      json.loads(stdout)
+      return True
+    except ValueError:
       return False
-    else:
-      arr = json.loads(stdout)
-      return any(ep['port'] == self.port and ep['protocol'] == self.protocol
-                 for ep in arr)
 
   def _Delete(self):
-    """Endpoint will be deleted with VM, so this is a noop."""
+    vm_util.IssueCommand(
+        [azure.AZURE_PATH, 'group', 'delete', '--yes', '--name', self.name],
+        timeout=600)
+
+  def _FormatTag(self, key, value):
+    """Format an individual tag for use with the --tags param of Azure CLI."""
+    return '{0}={1}'.format(key, value)
+
+  def FormatTags(self, tags_dict):
+    """Format a dict of tags into arguments for 'tag' parameter.
+
+    Args:
+      tags_dict: Tags to be formatted.
+
+    Returns:
+      A list of tags formatted as arguments for 'tag' parameter.
+    """
+    return [self._FormatTag(k, v) for k, v in tags_dict.iteritems()]
+
+  def _GetTags(self):
+    """Gets a list of tags to be used with the --tags param of Azure CLI."""
+    benchmark_spec = context.GetThreadBenchmarkSpec()
+    tags = self.FormatTags(benchmark_spec.GetResourceTags(self.timeout_minutes))
+
+    return tags
+
+
+class AzureAvailSet(resource.BaseResource):
+  """Object representing an Azure Availability Set."""
+
+  def __init__(self, name, location):
+    super(AzureAvailSet, self).__init__()
+    self.name = name
+    self.location = location
+    self.resource_group = GetResourceGroup()
+
+  def _Create(self):
+    """Create the availability set."""
+    create_cmd = [azure.AZURE_PATH,
+                  'vm',
+                  'availability-set',
+                  'create',
+                  '--resource-group', self.resource_group.name,
+                  '--name', self.name]
+    if self.location:
+      create_cmd.extend(['--location', self.location])
+    vm_util.IssueCommand(create_cmd)
+
+  def _Delete(self):
+    pass
+
+  @vm_util.Retry()
+  def _Exists(self):
+    """Returns True if the availability set exists."""
+    show_cmd = [azure.AZURE_PATH,
+                'vm',
+                'availability-set',
+                'show',
+                '--output', 'json',
+                '--resource-group', self.resource_group.name,
+                '--name', self.name]
+    stdout, _, _ = vm_util.IssueCommand(show_cmd)
+    return bool(json.loads(stdout))
+
+
+class AzureStorageAccount(resource.BaseResource):
+  """Object representing an Azure Storage Account."""
+
+  total_storage_accounts = 0
+
+  def __init__(self, storage_type, location, name,
+               kind=None, access_tier=None, resource_group=None,
+               use_existing=False):
+    super(AzureStorageAccount, self).__init__()
+    self.storage_type = storage_type
+    self.name = name
+    self.resource_group = resource_group or GetResourceGroup()
+    self.location = location
+    self.kind = kind or 'Storage'
+    self.use_existing = use_existing
+
+    AzureStorageAccount.total_storage_accounts += 1
+
+    if kind == 'BlobStorage':
+      self.access_tier = access_tier or 'Hot'
+    else:
+      # Access tiers are only valid for blob storage accounts.
+      assert access_tier is None
+      self.access_tier = access_tier
+
+  def _Create(self):
+    """Creates the storage account."""
+    if not self.use_existing:
+      create_cmd = [azure.AZURE_PATH,
+                    'storage',
+                    'account',
+                    'create',
+                    '--kind', self.kind,
+                    '--sku', self.storage_type,
+                    '--name', self.name] + self.resource_group.args
+      if self.location:
+        create_cmd.extend(
+            ['--location', self.location])
+      if self.kind == 'BlobStorage':
+        create_cmd.extend(
+            ['--access-tier', self.access_tier])
+      vm_util.IssueCommand(create_cmd)
+
+  def _PostCreate(self):
+    """Get our connection string and our keys."""
+
+    stdout, _ = vm_util.IssueRetryableCommand(
+        [azure.AZURE_PATH, 'storage', 'account', 'show-connection-string',
+         '--output', 'json',
+         '--name', self.name] + self.resource_group.args)
+
+    response = json.loads(stdout)
+    self.connection_string = response['connectionString']
+    # Connection strings are always represented the same way on the
+    # command line.
+    self.connection_args = ['--connection-string', self.connection_string]
+
+    stdout, _ = vm_util.IssueRetryableCommand(
+        [azure.AZURE_PATH, 'storage', 'account', 'keys', 'list',
+         '--output', 'json',
+         '--account-name', self.name] + self.resource_group.args)
+
+    response = json.loads(stdout)
+    # A new storage account comes with two keys, but we only need one.
+    assert response[0]['permissions'] == 'Full'
+    self.key = response[0]['value']
+
+  def _Delete(self):
+    """Deletes the storage account."""
+    delete_cmd = [azure.AZURE_PATH,
+                  'storage',
+                  'account',
+                  'delete',
+                  '--name', self.name,
+                  '--yes'] + self.resource_group.args
+    vm_util.IssueCommand(delete_cmd)
+
+  def _Exists(self):
+    """Returns true if the storage account exists."""
+    stdout, _, _ = vm_util.IssueCommand(
+        [azure.AZURE_PATH, 'storage', 'account', 'show',
+         '--output', 'json',
+         '--name', self.name] + self.resource_group.args,
+        suppress_warning=True)
+
+    try:
+      json.loads(stdout)
+      return True
+    except ValueError:
+      return False
+
+
+class AzureVirtualNetwork(resource.BaseResource):
+  """Object representing an Azure Virtual Network."""
+
+  num_vnets = 0
+  vnet_lock = threading.Lock()
+
+  def __init__(self, location, name):
+    super(AzureVirtualNetwork, self).__init__()
+    self.name = name
+    self.resource_group = GetResourceGroup()
+    self.location = location
+    self.args = ['--vnet-name', self.name]
+
+    with self.vnet_lock:
+      self.vnet_num = self.num_vnets
+      self.__class__.num_vnets += 1
+
+    # Allocate a different /16 in each region. This allows for 255
+    # regions (should be enough for anyone), and 65536 VMs in each
+    # region. Using different address spaces prevents us from
+    # accidentally contacting the wrong VM.
+    self.address_space = '10.%s.0.0/16' % self.vnet_num
+
+  def _Create(self):
+    """Creates the virtual network."""
+    vm_util.IssueCommand(
+        [azure.AZURE_PATH, 'network', 'vnet', 'create',
+         '--location', self.location,
+         '--address-prefixes', self.address_space,
+         '--name', self.name] + self.resource_group.args)
+
+  def _Delete(self):
+    """Deletes the virtual network."""
+    pass
+
+  @vm_util.Retry()
+  def _Exists(self):
+    """Returns true if the virtual network exists."""
+    stdout, _, _ = vm_util.IssueCommand(
+        [azure.AZURE_PATH, 'network', 'vnet', 'show',
+         '--output', 'json',
+         '--name', self.name] + self.resource_group.args,
+        suppress_warning=True)
+
+    return bool(json.loads(stdout))
+
+
+class AzureSubnet(resource.BaseResource):
+  """Object representing an Azure Subnet."""
+
+  def __init__(self, vnet, name):
+    super(AzureSubnet, self).__init__()
+    self.resource_group = GetResourceGroup()
+    self.vnet = vnet
+    self.name = name
+    self.args = ['--subnet', self.name]
+
+  def _Create(self):
+    vm_util.IssueCommand(
+        [azure.AZURE_PATH, 'network', 'vnet', 'subnet', 'create',
+         '--vnet-name', self.vnet.name,
+         '--address-prefix', self.vnet.address_space,
+         '--name', self.name] + self.resource_group.args)
+
+  @vm_util.Retry()
+  def _Exists(self):
+    stdout, _, _ = vm_util.IssueCommand(
+        [azure.AZURE_PATH, 'network', 'vnet', 'subnet', 'show',
+         '--vnet-name', self.vnet.name,
+         '--output', 'json',
+         '--name', self.name] + self.resource_group.args)
+
+    return bool(json.loads(stdout))
+
+  def _Delete(self):
     pass
 
 
-class AzureFirewall(network.BaseFirewall):
-  """An object representing the Azure Firewall equivalent.
+class AzureNetworkSecurityGroup(resource.BaseResource):
+  """Object representing an Azure Network Security Group."""
 
-  On Azure, endpoints are used to open ports instead of firewalls.
+  def __init__(self, location, subnet, name):
+    super(AzureNetworkSecurityGroup, self).__init__()
+
+    self.location = location
+    self.subnet = subnet
+    self.name = name
+    self.resource_group = GetResourceGroup()
+    self.args = ['--nsg', self.name]
+
+    self.rules_lock = threading.Lock()
+    # Mapping of (start_port, end_port) -> rule name, used to
+    # deduplicate rules. We expect duplicate rules because PKB will
+    # call AllowPort() for each VM on a subnet, but the rules are
+    # actually applied to the entire subnet.
+    self.rules = {}
+    # True if the special 'DenyAll' rule is present.
+    self.have_deny_all_rule = False
+
+  def _Create(self):
+    vm_util.IssueCommand(
+        [azure.AZURE_PATH, 'network', 'nsg', 'create',
+         '--location', self.location,
+         '--name', self.name] + self.resource_group.args)
+
+  @vm_util.Retry()
+  def _Exists(self):
+    stdout, _, _ = vm_util.IssueCommand(
+        [azure.AZURE_PATH, 'network', 'nsg', 'show',
+         '--output', 'json',
+         '--name', self.name] + self.resource_group.args)
+
+    return bool(json.loads(stdout))
+
+  def _Delete(self):
+    pass
+
+  def AttachToSubnet(self):
+    vm_util.IssueRetryableCommand(
+        [azure.AZURE_PATH, 'network', 'vnet', 'subnet', 'update',
+         '--name', self.subnet.name,
+         '--network-security-group', self.name] +
+        self.resource_group.args +
+        self.subnet.vnet.args)
+
+  def AllowPort(self, vm, start_port, end_port=None, source_range=None):
+    """Open a port or port range.
+
+    Args:
+      vm: the virtual machine to open the port for.
+      start_port: either a single port or the start of a range.
+      end_port: if given, the end of the port range.
+      source_range: unsupported at present.
+
+    Raises:
+      ValueError: when there are too many firewall rules.
+    """
+
+    with self.rules_lock:
+      end_port = end_port or start_port
+
+      if (start_port, end_port) in self.rules:
+        return
+      port_range = '%s-%s' % (start_port, end_port)
+      rule_name = 'allow-%s' % port_range
+      # Azure priorities are between 100 and 4096, but we reserve 4095
+      # for the special DenyAll rule created by DisallowAllPorts.
+      rule_priority = 100 + len(self.rules)
+      if rule_priority >= 4095:
+        raise ValueError('Too many firewall rules!')
+      self.rules[(start_port, end_port)] = rule_name
+
+    vm_util.IssueRetryableCommand(
+        [azure.AZURE_PATH, 'network', 'nsg', 'rule', 'create',
+         '--name', rule_name,
+         '--destination-port-range', port_range,
+         '--access', 'Allow',
+         '--priority', str(rule_priority)]
+        + self.resource_group.args
+        + self.args)
+
+
+class AzureFirewall(network.BaseFirewall):
+  """A fireall on Azure is a Network Security Group.
+
+  NSGs are per-subnet, but this class is per-provider, so we just
+  proxy methods through to the right NSG instance.
   """
 
   CLOUD = providers.AZURE
 
-  def AllowPort(self, vm, port):
+  def AllowPort(self, vm, start_port, end_port=None, source_range=None):
     """Opens a port on the firewall.
 
     Args:
       vm: The BaseVirtualMachine object to open the port for.
-      port: The local port to open.
+      start_port: The local port to open.
+      end_port: if given, open the range [start_port, end_port].
+      source_range: unsupported at present.
     """
-    if vm.is_static or port == SSH_PORT:
-      return
-    _AzureEndpoint(vm.name, port, 'tcp').Create()
-    _AzureEndpoint(vm.name, port, 'udp').Create()
+
+    vm.network.nsg.AllowPort(vm, start_port, end_port=end_port,
+                             source_range=source_range)
 
   def DisallowAllPorts(self):
     """Closes all ports on the firewall."""
     pass
 
 
-class AzureAffinityGroup(resource.BaseResource):
-  """Object representing an Azure Affinity Group."""
-
-  def __init__(self, name, zone):
-    super(AzureAffinityGroup, self).__init__()
-    self.name = name
-    self.zone = zone
-
-  def _Create(self):
-    """Creates the affinity group."""
-    create_cmd = [AZURE_PATH,
-                  'account',
-                  'affinity-group',
-                  'create',
-                  '--location=%s' % self.zone,
-                  '--label=%s' % self.name,
-                  self.name]
-    vm_util.IssueCommand(create_cmd)
-
-  def _Delete(self):
-    """Deletes the affinity group."""
-    delete_cmd = [AZURE_PATH,
-                  'account',
-                  'affinity-group',
-                  'delete',
-                  '--quiet',
-                  self.name]
-    vm_util.IssueCommand(delete_cmd)
-
-  def _Exists(self):
-    """Returns true if the affinity group exists."""
-    show_cmd = [AZURE_PATH,
-                'account',
-                'affinity-group',
-                'show',
-                '--json',
-                self.name]
-    stdout, _, _ = vm_util.IssueCommand(show_cmd, suppress_warning=True)
-    try:
-      json.loads(stdout)
-    except ValueError:
-      return False
-    return True
-
-
-class AzureStorageAccount(resource.BaseResource):
-  """Object representing an Azure Storage Account."""
-
-  def __init__(self, name, storage_type, affinity_group_name):
-    super(AzureStorageAccount, self).__init__()
-    self.name = name
-    self.storage_type = storage_type
-    self.affinity_group_name = affinity_group_name
-
-  def _Create(self):
-    """Creates the storage account."""
-    create_cmd = [AZURE_PATH,
-                  'storage',
-                  'account',
-                  'create',
-                  '--affinity-group=%s' % self.affinity_group_name,
-                  '--type=%s' % self.storage_type,
-                  self.name]
-    vm_util.IssueCommand(create_cmd)
-
-  def _Delete(self):
-    """Deletes the storage account."""
-    delete_cmd = [AZURE_PATH,
-                  'storage',
-                  'account',
-                  'delete',
-                  '--quiet',
-                  self.name]
-    vm_util.IssueCommand(delete_cmd)
-
-  def _Exists(self):
-    """Returns true if the storage account exists."""
-    show_cmd = [AZURE_PATH,
-                'storage',
-                'account',
-                'show',
-                '--json',
-                self.name]
-    stdout, _, _ = vm_util.IssueCommand(show_cmd, suppress_warning=True)
-    try:
-      json.loads(stdout)
-    except ValueError:
-      return False
-    return True
-
-
-class AzureVirtualNetwork(resource.BaseResource):
-  """Object representing an Azure Virtual Network."""
-
-  def __init__(self, name):
-    super(AzureVirtualNetwork, self).__init__()
-    self.name = name
-
-  def _Create(self):
-    """Creates the virtual network."""
-    create_cmd = [AZURE_PATH,
-                  'network',
-                  'vnet',
-                  'create',
-                  '--affinity-group=%s' % self.name,
-                  self.name]
-    vm_util.IssueCommand(create_cmd)
-
-  def _Delete(self):
-    """Deletes the virtual network."""
-    delete_cmd = [AZURE_PATH,
-                  'network',
-                  'vnet',
-                  'delete',
-                  '--quiet',
-                  self.name]
-    vm_util.IssueCommand(delete_cmd)
-
-  def _Exists(self):
-    """Returns true if the virtual network exists."""
-    show_cmd = [AZURE_PATH,
-                'network',
-                'vnet',
-                'show',
-                '--json',
-                self.name]
-    stdout, _, _ = vm_util.IssueCommand(show_cmd, suppress_warning=True)
-    vnet = json.loads(stdout)
-    if vnet:
-      return True
-    return False
-
-
 class AzureNetwork(network.BaseNetwork):
-  """Object representing an Azure Network."""
+  """Regional network components.
+
+  A container object holding all of the network-related objects that
+  we need for an Azure zone (aka region).
+  """
 
   CLOUD = providers.AZURE
 
   def __init__(self, spec):
     super(AzureNetwork, self).__init__(spec)
-    name = ('pkb%s%s' %
-            (FLAGS.run_uri, str(uuid.uuid4())[-12:])).lower()[:MAX_NAME_LENGTH]
-    self.affinity_group = AzureAffinityGroup(name, spec.zone)
-    storage_account_name = (STORAGE_ACCOUNT_PREFIX + name)[:MAX_NAME_LENGTH]
+    self.resource_group = GetResourceGroup()
+    self.avail_set = AzureAvailSet(self.resource_group.name, self.zone)
+
+    # Storage account names can't include separator characters :(.
+    storage_account_prefix = 'pkb%s' % FLAGS.run_uri
+
+    # Storage account names must be 3-24 characters long and use
+    # numbers and lower-case letters only, which leads us to this
+    # awful naming scheme.
+    suffix = 'storage%d' % AzureStorageAccount.total_storage_accounts
     self.storage_account = AzureStorageAccount(
-        storage_account_name, FLAGS.azure_storage_type, name)
-    self.vnet = AzureVirtualNetwork(name)
+        FLAGS.azure_storage_type, self.zone,
+        storage_account_prefix[:24 - len(suffix)] + suffix)
+    prefix = '%s-%s' % (self.resource_group.name, self.zone)
+    self.vnet = AzureVirtualNetwork(self.zone, prefix + '-vnet')
+    self.subnet = AzureSubnet(self.vnet, self.vnet.name + '-subnet')
+    self.nsg = AzureNetworkSecurityGroup(self.zone, self.subnet,
+                                         self.subnet.name + '-nsg')
 
   @vm_util.Retry()
   def Create(self):
-    """Creates the actual network."""
-    self.affinity_group.Create()
+    """Creates the network."""
+    # If the benchmark includes multiple zones,
+    # self.resource_group.Create() will be called more than once. But
+    # BaseResource will prevent us from running the underlying Azure
+    # commands more than once, so that is fine.
+    self.resource_group.Create()
+
+    self.avail_set.Create()
 
     self.storage_account.Create()
 
     self.vnet.Create()
 
+    self.subnet.Create()
+
+    self.nsg.Create()
+    self.nsg.AttachToSubnet()
+
   def Delete(self):
-    """Deletes the actual network."""
-    self.vnet.Delete()
-
-    self.storage_account.Delete()
-
-    self.affinity_group.Delete()
+    """Deletes the network."""
+    # If the benchmark includes multiple zones, this will be called
+    # multiple times, but there will be no bad effects from multiple
+    # deletes.
+    self.resource_group.Delete()

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Requirements for running PerfKit Benchmarker on OpenStack.
+# Requirements for running PerfKitBenchmarker on OpenStack.
 -r../../../requirements.txt
-python-keystoneclient==2.1.1
-python-novaclient==2.35.0
+openstacksdk>=0.9.10
+python-openstackclient>=3.6.0

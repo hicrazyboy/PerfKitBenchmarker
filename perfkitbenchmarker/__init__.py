@@ -11,9 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Import flags."""
 
-import gflags as flags  # NOQA
-try:
-  from gflags import validators as flags_validators  # NOQA
-except ImportError:
-  from gflags import gflags_validators as flags_validators  # NOQA
+from absl import flags  # NOQA
+from absl import app    # NOQA

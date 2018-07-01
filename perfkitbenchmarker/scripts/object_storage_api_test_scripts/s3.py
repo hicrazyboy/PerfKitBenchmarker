@@ -17,13 +17,11 @@
 import logging
 import time
 
-import gflags as flags
+from absl import flags
 
 import boto_service
 
 FLAGS = flags.FLAGS
-
-flags.DEFINE_string('host', None, 'The hostname of the storage endpoint.')
 
 
 class S3Service(boto_service.BotoService):

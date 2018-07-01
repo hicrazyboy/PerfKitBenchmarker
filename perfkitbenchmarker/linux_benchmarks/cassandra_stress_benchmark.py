@@ -200,7 +200,7 @@ def GetConfig(user_config):
   return configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
 
 
-def CheckPrerequisites():
+def CheckPrerequisites(benchmark_config):
   """Verifies that the required resources are present.
 
   Raises:
@@ -251,6 +251,7 @@ def GenerateMetadataFromFlags(benchmark_spec):
 
 
   metadata.update({
+      'concurrent_reads': FLAGS.cassandra_concurrent_reads,
       'num_data_nodes': len(vm_dict[CASSANDRA_GROUP]),
       'num_loader_nodes': len(vm_dict[CLIENT_GROUP]),
       'num_cassandra_stress_threads': FLAGS.num_cassandra_stress_threads,

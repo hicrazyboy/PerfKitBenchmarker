@@ -97,7 +97,7 @@ def GetConfig(user_config):
   return config
 
 
-def CheckPrerequisites():
+def CheckPrerequisites(benchmark_config):
   """Verifies that the required resources are present.
 
   Raises:
@@ -200,13 +200,14 @@ def Prepare(benchmark_spec):
       posixpath.join(hbase.HBASE_CONF_DIR, HBASE_SITE))
 
   def PushHBaseSite(vm):
-    conf_dir = posixpath.join(ycsb.YCSB_DIR, 'hbase-binding', 'conf')
+    conf_dir = posixpath.join(ycsb.YCSB_DIR, 'hbase10-binding', 'conf')
     vm.RemoteCommand('mkdir -p {}'.format(conf_dir))
     vm.PushFile(
         os.path.join(vm_util.GetTempDir(), HBASE_SITE),
         posixpath.join(conf_dir, HBASE_SITE))
 
   vm_util.RunThreaded(PushHBaseSite, loaders)
+  benchmark_spec.executor = ycsb.YCSBExecutor('hbase10')
 
 
 def Run(benchmark_spec):
@@ -222,8 +223,6 @@ def Run(benchmark_spec):
   by_role = _GetVMsByRole(benchmark_spec.vm_groups)
   loaders = by_role['clients']
   logging.info('Loaders: %s', loaders)
-
-  executor = ycsb.YCSBExecutor('hbase-10')
 
   metadata = {'ycsb_client_vms': len(loaders),
               'hbase_cluster_size': len(by_role['hbase_vms']),
@@ -242,9 +241,8 @@ def Run(benchmark_spec):
   load_kwargs['clientbuffering'] = 'true'
   if not FLAGS['ycsb_preload_threads'].present:
     load_kwargs['threads'] = 1
-  samples = list(executor.LoadAndRun(loaders,
-                                     load_kwargs=load_kwargs,
-                                     run_kwargs=run_kwargs))
+  samples = list(benchmark_spec.executor.LoadAndRun(
+      loaders, load_kwargs=load_kwargs, run_kwargs=run_kwargs))
   for sample in samples:
     sample.metadata.update(metadata)
 

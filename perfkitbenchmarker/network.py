@@ -51,12 +51,22 @@ class BaseFirewall(object):
         benchmark_spec.firewalls[key] = cls()
       return benchmark_spec.firewalls[key]
 
-  def AllowPort(self, vm, port):
+  def AllowIcmp(self, vm):
+    """Opens the ICMP protocol on the firewall.
+
+    Args:
+      vm: The BaseVirtualMachine object to open the ICMP protocol for.
+    """
+    pass
+
+  def AllowPort(self, vm, start_port, end_port=None):
     """Opens a port on the firewall.
 
     Args:
       vm: The BaseVirtualMachine object to open the port for.
-      port: The local port to open.
+      start_port: The first local port in a range of ports to open.
+      end_port: The last port in a range of ports to open. If None, only
+        start_port will be opened.
     """
     pass
 
@@ -75,6 +85,9 @@ class BaseNetworkSpec(object):
       zone: The zone in which to create the network.
     """
     self.zone = zone
+
+  def __repr__(self):
+    return '%s(%r)' % (self.__class__, self.__dict__)
 
 
 class BaseNetwork(object):
@@ -110,11 +123,25 @@ class BaseNetwork(object):
     Args:
       vm: The VM for which the Network is being created.
     """
+    return cls.GetNetworkFromNetworkSpec(cls._GetNetworkSpecFromVm(vm))
+
+  @classmethod
+  def GetNetworkFromNetworkSpec(cls, spec):
+    """Returns a BaseNetwork.
+
+    This method is used instead of directly calling the class's constructor.
+    It creates BaseNetwork instances and registers them. If a BaseNetwork
+    object has already been registered with the same key, that object
+    will be returned rather than creating a new one. This enables multiple
+    VMs to call this method and all share the same BaseNetwork object.
+
+    Args:
+      spec: The network spec for the network.
+    """
     benchmark_spec = context.GetThreadBenchmarkSpec()
     if benchmark_spec is None:
       raise errors.Error('GetNetwork called in a thread without a '
                          'BenchmarkSpec.')
-    spec = cls._GetNetworkSpecFromVm(vm)
     key = cls._GetKeyFromNetworkSpec(spec)
     with benchmark_spec.networks_lock:
       if key not in benchmark_spec.networks:

@@ -15,11 +15,11 @@
 
 """Module containing Silo installation and cleanup functions."""
 
-from perfkitbenchmarker import vm_util
+from perfkitbenchmarker.linux_packages import INSTALL_DIR
 
 GIT_REPO = 'https://github.com/stephentu/silo.git'
 GIT_TAG = '62d2d498984bf69d3b46a74e310e1fd12fd1f692'
-SILO_DIR = '%s/silo' % vm_util.VM_TMP_DIR
+SILO_DIR = '%s/silo' % INSTALL_DIR
 APT_PACKAGES = ('libjemalloc-dev libnuma-dev libdb++-dev '
                 'libmysqld-dev libaio-dev libssl-dev')
 YUM_PACKAGES = ('jemalloc-devel numactl-devel libdb-cxx-devel mysql-devel '
@@ -36,12 +36,18 @@ def _Install(vm):
   # This is due to a failing clone command when executing behind a proxy.
   # Replacing the protocol to https instead of git fixes the issue.
   vm.RemoteCommand('git config --global url."https://".insteadOf git://')
-  vm.RemoteCommand('cd {0} && MODE=perf DEBUG=0 CHECK_INVARIANTS=0 make\
-          -j{1} dbtest'.format(SILO_DIR, nthreads))
+  # Disable -Wmaybe-uninitialized errors when GCC has the option to workaround
+  # a spurious error in masstree.
+  cxx = '"g++ -std=gnu++0x \
+          $(echo | gcc -Wmaybe-uninitialized -E - >/dev/null 2>&1 && \
+            echo -Wno-error=maybe-uninitialized)"'
+  vm.RemoteCommand('cd {0} && CXX={2} MODE=perf DEBUG=0 CHECK_INVARIANTS=0 make\
+          -j{1} dbtest'.format(SILO_DIR, nthreads, cxx))
 
 
 def YumInstall(vm):
   """Installs the Silo package on the VM."""
+  vm.InstallEpelRepo()
   vm.InstallPackages(YUM_PACKAGES)
   _Install(vm)
 

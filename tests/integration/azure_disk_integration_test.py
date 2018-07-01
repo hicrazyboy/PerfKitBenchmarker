@@ -19,6 +19,8 @@ import unittest
 
 from perfkitbenchmarker import pkb
 from perfkitbenchmarker import test_util
+from perfkitbenchmarker.providers.azure import azure_disk
+from perfkitbenchmarker.providers.azure import flags as azure_flags
 
 MOUNT_POINT = '/scratch'
 
@@ -37,7 +39,7 @@ class AzureScratchDiskIntegrationTest(unittest.TestCase):
   def testPremiumStorage(self):
     test_util.assertDiskMounts({
         'flags': {
-            'azure_storage_type': 'PLRS'
+            'azure_storage_type': azure_flags.PLRS
         },
         'vm_groups': {
             'vm_group_1': {
@@ -45,12 +47,12 @@ class AzureScratchDiskIntegrationTest(unittest.TestCase):
                 'vm_spec': {
                     'Azure': {
                         'machine_type': 'Standard_DS2',
-                        'zone': 'East US'
+                        'zone': 'eastus'
                     }
                 },
                 'disk_spec': {
                     'Azure': {
-                        'disk_type': 'premium-storage',
+                        'disk_type': azure_disk.PREMIUM_STORAGE,
                         'disk_size': 10,  # disk size must be between
                                           # 10 and 1024 GB.
                         'mount_point': MOUNT_POINT
@@ -63,7 +65,7 @@ class AzureScratchDiskIntegrationTest(unittest.TestCase):
   def testStandardDisk(self):
     test_util.assertDiskMounts({
         'flags': {
-            'azure_storage_type': 'LRS'
+            'azure_storage_type': azure_flags.LRS
         },
         'vm_groups': {
             'vm_group_1': {
@@ -71,12 +73,12 @@ class AzureScratchDiskIntegrationTest(unittest.TestCase):
                 'vm_spec': {
                     'Azure': {
                         'machine_type': 'Standard_D2',
-                        'zone': 'East US'
+                        'zone': 'eastus'
                     }
                 },
                 'disk_spec': {
                     'Azure': {
-                        'disk_type': 'standard-disk',
+                        'disk_type': azure_disk.STANDARD_DISK,
                         'disk_size': 2,
                         'mount_point': MOUNT_POINT
                     }
@@ -93,7 +95,7 @@ class AzureScratchDiskIntegrationTest(unittest.TestCase):
                 'vm_spec': {
                     'Azure': {
                         'machine_type': 'Standard_D1',
-                        'zone': 'East US'
+                        'zone': 'eastus'
                     }
                 },
                 'disk_spec': {

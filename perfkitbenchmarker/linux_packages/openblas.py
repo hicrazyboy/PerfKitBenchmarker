@@ -14,9 +14,9 @@
 
 """Module containing OpenBLAS installation and cleanup functions."""
 
-from perfkitbenchmarker import vm_util
+from perfkitbenchmarker.linux_packages import INSTALL_DIR
 
-OPENBLAS_DIR = '%s/OpenBLAS' % vm_util.VM_TMP_DIR
+OPENBLAS_DIR = '%s/OpenBLAS' % INSTALL_DIR
 GIT_REPO = 'https://github.com/xianyi/OpenBLAS'
 GIT_TAG = 'v0.2.15'
 
@@ -27,7 +27,7 @@ def _Install(vm):
   vm.Install('fortran')
   vm.RemoteCommand('git clone {0} {1}'.format(GIT_REPO, OPENBLAS_DIR))
   vm.RemoteCommand('cd {0} && git checkout {1}'.format(OPENBLAS_DIR, GIT_TAG))
-  vm.RemoteCommand('cd {0} && make'.format(OPENBLAS_DIR))
+  vm.RemoteCommand('cd {0} && make USE_THREAD=0'.format(OPENBLAS_DIR))
 
 
 def YumInstall(vm):

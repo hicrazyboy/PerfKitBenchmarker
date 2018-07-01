@@ -29,15 +29,17 @@ import shutil
 
 import pkg_resources
 
+import perfkitbenchmarker
+
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import temp_dir
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_multistring('data_search_paths', ['.'],
-                         'Additional paths to search for data files. '
-                         'These paths will be searched prior to using files '
-                         'bundled with PerfKitBenchmarker')
+flags.DEFINE_multi_string('data_search_paths', ['.'],
+                          'Additional paths to search for data files. '
+                          'These paths will be searched prior to using files '
+                          'bundled with PerfKitBenchmarker.')
 
 _RESOURCES = 'resources'
 
@@ -115,6 +117,7 @@ class PackageResourceLoader(ResourceLoader):
   Attributes:
     package: string. Name of the package containing resources.
   """
+
   def __init__(self, package):
     self.package = package
 
@@ -147,9 +150,15 @@ class PackageResourceLoader(ResourceLoader):
 
 
 DATA_PACKAGE_NAME = 'perfkitbenchmarker.data'
+YCSB_WORKLOAD_DIR_NAME = os.path.join(
+    os.path.dirname(perfkitbenchmarker.__file__), 'data/ycsb')
+EDW_SCRIPT_DIR_NAME = os.path.join(
+    os.path.dirname(perfkitbenchmarker.__file__), 'data/edw')
 SCRIPT_PACKAGE_NAME = 'perfkitbenchmarker.scripts'
 CONFIG_PACKAGE_NAME = 'perfkitbenchmarker.configs'
 DEFAULT_RESOURCE_LOADERS = [PackageResourceLoader(DATA_PACKAGE_NAME),
+                            FileResourceLoader(YCSB_WORKLOAD_DIR_NAME),
+                            FileResourceLoader(EDW_SCRIPT_DIR_NAME),
                             PackageResourceLoader(SCRIPT_PACKAGE_NAME),
                             PackageResourceLoader(CONFIG_PACKAGE_NAME)]
 
@@ -206,3 +215,26 @@ def ResourcePath(resource_name, search_user_paths=True):
 
   raise ResourceNotFound(
       '{0} (Searched: {1})'.format(resource_name, loaders))
+
+
+def ResourceExists(resource_name, search_user_paths=True):
+  """Returns True if a resource exists.
+
+  Loaders are searched in order until the resource is found.
+  If no loader provides 'resource_name', returns False.
+
+  If 'search_user_paths' is true, the directories specified by
+  "--data_search_paths" are consulted before the default paths.
+
+  Args:
+    resource_name: string. Name of a resource.
+    search_user_paths: boolean. Whether paths from "--data_search_paths" should
+      be searched before the default paths.
+  Returns:
+    Whether the resource exists.
+  """
+  try:
+    ResourcePath(resource_name, search_user_paths)
+    return True
+  except ResourceNotFound:
+    return False

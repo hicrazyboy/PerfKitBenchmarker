@@ -40,10 +40,10 @@ flags.DEFINE_integer('ntttcp_time', 60,
 CONTROL_PORT = 6001
 BASE_DATA_PORT = 5001
 NTTTCP_RETRIES = 5
-NTTTCP_DIR = 'NTttcp-v5.31'
+NTTTCP_DIR = 'NTttcp-v5.33'
 NTTTCP_ZIP = NTTTCP_DIR + '.zip'
 NTTTCP_URL = ('https://gallery.technet.microsoft.com/NTttcp-Version-528-'
-              'Now-f8b12769/file/139788/1/' + NTTTCP_ZIP)
+              'Now-f8b12769/file/159655/1/' + NTTTCP_ZIP)
 
 
 def Install(vm):
@@ -65,7 +65,7 @@ def RunNtttcp(sending_vm, receiving_vm, receiving_ip_address, ip_type):
   server_options = '-r -m \'{threads},*,0.0.0.0\''.format(
       threads=FLAGS.ntttcp_threads)
 
-  ntttcp_exe_dir = ntpath.join(sending_vm.temp_dir, 'x86')
+  ntttcp_exe_dir = ntpath.join(sending_vm.temp_dir, 'x86fre')
 
   # NTttcp will append to the xml file when it runs, which causes parsing
   # to fail if there was a preexisting xml file. To be safe, try deleting
@@ -76,7 +76,6 @@ def RunNtttcp(sending_vm, receiving_vm, receiving_ip_address, ip_type):
       rm_command, ignore_failure=True, suppress_warning=True)
 
   def _RunNtttcp(vm, options):
-    ntttcp_exe_dir = ntpath.join(vm.temp_dir, 'x86')
     command = 'cd {ntttcp_exe_dir}; .\\NTttcp.exe {ntttcp_options}'.format(
         ntttcp_exe_dir=ntttcp_exe_dir, ntttcp_options=options)
     vm.RemoteCommand(command)
@@ -91,8 +90,7 @@ def RunNtttcp(sending_vm, receiving_vm, receiving_ip_address, ip_type):
 
   metadata = {'ip_type': ip_type}
   for vm_specifier, vm in ('receiving', receiving_vm), ('sending', sending_vm):
-    metadata['{0}_zone'.format(vm_specifier)] = vm.zone
-    for k, v in vm.GetMachineTypeDict().iteritems():
+    for k, v in vm.GetResourceMetadata().iteritems():
       metadata['{0}_{1}'.format(vm_specifier, k)] = v
 
   return ParseNtttcpResults(stdout, metadata)

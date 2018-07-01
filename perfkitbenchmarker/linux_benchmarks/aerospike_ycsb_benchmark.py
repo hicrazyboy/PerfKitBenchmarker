@@ -40,22 +40,27 @@ aerospike_ycsb:
     installation. Specify the number of YCSB VMs with
     --ycsb_client_vms.
   vm_groups:
-    clients:
-      vm_spec: *default_single_core
     workers:
       vm_spec: *default_single_core
       disk_spec: *default_500_gb
       vm_count: null
       disk_count: 0
+    clients:
+      vm_spec: *default_single_core
 """
 
 
 def GetConfig(user_config):
   config = configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
 
-  if (FLAGS.aerospike_storage_type == aerospike_server.DISK and
-      FLAGS.data_disk_type != disk.LOCAL):
-    config['vm_groups']['workers']['disk_count'] = 1
+  if FLAGS.aerospike_storage_type == aerospike_server.DISK:
+    if FLAGS.data_disk_type == disk.LOCAL:
+      # Didn't know max number of local disks, decide later.
+      config['vm_groups']['workers']['disk_count'] = (
+          config['vm_groups']['workers']['disk_count'] or None)
+    else:
+      config['vm_groups']['workers']['disk_count'] = (
+          config['vm_groups']['workers']['disk_count'] or 1)
 
   if FLAGS['ycsb_client_vms'].present:
     config['vm_groups']['clients']['vm_count'] = FLAGS.ycsb_client_vms
@@ -63,7 +68,7 @@ def GetConfig(user_config):
   return config
 
 
-def CheckPrerequisites():
+def CheckPrerequisites(benchmark_config):
   """Verifies that the required resources are present.
 
   Raises:
@@ -95,6 +100,10 @@ def Prepare(benchmark_spec):
                       for vm in loaders]
 
   vm_util.RunThreaded(lambda f: f(), aerospike_install_fns + ycsb_install_fns)
+  benchmark_spec.executor = ycsb.YCSBExecutor(
+      'aerospike',
+      **{'as.host': aerospike_vms[0].internal_ip,
+         'as.namespace': 'test'})
 
 
 def Run(benchmark_spec):
@@ -110,14 +119,11 @@ def Run(benchmark_spec):
   loaders = benchmark_spec.vm_groups['clients']
   aerospike_vms = benchmark_spec.vm_groups['workers']
 
-  executor = ycsb.YCSBExecutor('aerospike',
-                               **{'as.host': aerospike_vms[0].internal_ip,
-                                  'as.namespace': 'test'})
-
   metadata = {'ycsb_client_vms': FLAGS.ycsb_client_vms,
-              'num_vms': len(aerospike_vms)}
+              'num_vms': len(aerospike_vms),
+              'Storage Type': FLAGS.aerospike_storage_type}
 
-  samples = list(executor.LoadAndRun(loaders))
+  samples = list(benchmark_spec.executor.LoadAndRun(loaders))
 
   for sample in samples:
     sample.metadata.update(metadata)

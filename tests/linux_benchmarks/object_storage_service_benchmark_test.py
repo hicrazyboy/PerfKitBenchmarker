@@ -12,42 +12,119 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for ping_benchmark."""
+"""Tests for object storage service benchmark."""
 
+import datetime
+import time
 import unittest
 import mock
+
 from perfkitbenchmarker.linux_benchmarks import object_storage_service_benchmark
-from perfkitbenchmarker import benchmark_spec
-from perfkitbenchmarker import providers
 from tests import mock_flags
 
-PKB = 'perfkitbenchmarker'
-MOD_PATH = PKB + '.linux_benchmarks.object_storage_service_benchmark'
+
+class TestBuildCommands(unittest.TestCase):
+  def setUp(self):
+    mocked_flags = mock_flags.PatchTestCaseFlags(self)
+
+    mocked_flags.object_storage_multistream_objects_per_stream = 100
+    mocked_flags.object_storage_object_sizes = {'1KB': '100%'}
+    mocked_flags.object_storage_streams_per_vm = 1
+    mocked_flags.num_vms = 1
+    mocked_flags.object_storage_object_naming_scheme = 'sequential_by_stream'
+
+  def testBuildCommands(self):
+    vm = mock.MagicMock()
+    vm.RobustRemoteCommand = mock.MagicMock(return_value=('', ''))
+
+    command_builder = mock.MagicMock()
+    service = mock.MagicMock()
+
+    with mock.patch(time.__name__ + '.time', return_value=1.0):
+      with mock.patch(object_storage_service_benchmark.__name__ +
+                      '._ProcessMultiStreamResults'):
+        with mock.patch(object_storage_service_benchmark.__name__ +
+                        '.LoadWorkerOutput', return_value=(None, None, None)):
+          object_storage_service_benchmark.MultiStreamRWBenchmark(
+              [], {}, [vm], command_builder, service, 'bucket')
+
+    self.assertEqual(
+        command_builder.BuildCommand.call_args_list[0],
+        mock.call(['--bucket=bucket',
+                   '--objects_per_stream=100',
+                   '--num_streams=1',
+                   '--start_time=16.1',
+                   '--objects_written_file=/tmp/pkb/pkb-objects-written',
+                   '--object_sizes="{1000: 100.0}"',
+                   '--object_naming_scheme=sequential_by_stream',
+                   '--scenario=MultiStreamWrite',
+                   '--stream_num_start=0']))
+
+    self.assertEqual(
+        command_builder.BuildCommand.call_args_list[1],
+        mock.call(['--bucket=bucket',
+                   '--objects_per_stream=100',
+                   '--num_streams=1',
+                   '--start_time=16.1',
+                   '--objects_written_file=/tmp/pkb/pkb-objects-written',
+                   '--scenario=MultiStreamRead',
+                   '--stream_num_start=0']))
 
 
-class TestGenerateJobFileString(unittest.TestCase):
+class TestDistributionToBackendFormat(unittest.TestCase):
+  def testPointDistribution(self):
+    dist = {'100KB': '100%'}
+
+    self.assertEqual(
+        object_storage_service_benchmark._DistributionToBackendFormat(dist),
+        {100000: 100.0})
+
+  def testMultiplePointsDistribution(self):
+    dist = {'1B': '10%',
+            '2B': '20%',
+            '4B': '70%'}
+
+    self.assertEqual(
+        object_storage_service_benchmark._DistributionToBackendFormat(dist),
+        {1: 10.0,
+         2: 20.0,
+         4: 70.0})
+
+  def testAbbreviatedPointDistribution(self):
+    dist = '100KB'
+
+    self.assertEqual(
+        object_storage_service_benchmark._DistributionToBackendFormat(dist),
+        {100000: 100.0})
+
+  def testBadPercentages(self):
+    dist = {'1B': '50%'}
+
+    with self.assertRaises(ValueError):
+      object_storage_service_benchmark._DistributionToBackendFormat(dist)
 
 
-  def testRunCountTest(self):
-    with mock.patch('os.path.isfile', return_value=True),\
-        mock.patch(PKB + '.data.ResourcePath', return_value=['a', 'b']),\
-        mock.patch('os.listdir', return_value=[]),\
-        mock.patch(MOD_PATH + '.S3StorageBenchmark.Prepare') as Prepare,\
-        mock.patch(MOD_PATH
-                   + '.S3StorageBenchmark.Run') as Run, mock.patch(
-                       MOD_PATH + '.S3StorageBenchmark.Cleanup') as Cleanup:
-      flags = mock_flags.PatchTestCaseFlags(self)
-      flags.storage = providers.AWS
-      flags.object_storage_scenario = 'all'
-      vm_spec = mock.MagicMock(spec=benchmark_spec.BenchmarkSpec)
-      vm0 = mock.MagicMock()
-      vm_spec.vms = [vm0]
-      object_storage_service_benchmark.Prepare(vm_spec)
-      self.assertEqual(Prepare.call_count, 1)
-      object_storage_service_benchmark.Run(vm_spec)
-      self.assertEqual(Run.call_count, 1)
-      object_storage_service_benchmark.Cleanup(vm_spec)
-      self.assertEqual(Cleanup.call_count, 1)
+class TestColdObjectsWrittenFiles(unittest.TestCase):
+
+  def testFilename(self):
+    """Tests the objects written filename can be parsed for an age."""
+    with mock_flags.PatchFlags() as mocked_flags:
+      mocked_flags.object_storage_region = 'us-central1-a'
+      mocked_flags.object_storage_objects_written_file_prefix = 'prefix'
+      write_time = datetime.datetime.now() - datetime.timedelta(hours=72)
+      with mock.patch.object(object_storage_service_benchmark, '_DatetimeNow',
+                             return_value=write_time):
+        filename = (
+            object_storage_service_benchmark._ColdObjectsWrittenFilename())
+      read_time = datetime.datetime.now()
+      with mock.patch.object(object_storage_service_benchmark, '_DatetimeNow',
+                             return_value=read_time):
+        age = object_storage_service_benchmark._ColdObjectsWrittenFileAgeHours(
+            filename)
+      # Verify that the age is between 72 and 73 hours.
+      self.assertLessEqual(72, age)
+      self.assertLessEqual(age, 73)
+
 
 if __name__ == '__main__':
   unittest.main()

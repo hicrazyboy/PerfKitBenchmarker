@@ -32,6 +32,9 @@ from perfkitbenchmarker.linux_packages import ycsb
 # See http://api.mongodb.org/java/2.13/com/mongodb/WriteConcern.html
 flags.DEFINE_string('mongodb_writeconcern', 'acknowledged',
                     'MongoDB write concern.')
+flags.DEFINE_integer('mongodb_readahead_kb', None,
+                     'Configure block device readahead settings.')
+
 
 FLAGS = flags.FLAGS
 
@@ -69,6 +72,9 @@ def _PrepareServer(vm):
       "sudo sed -i -e '/bind_ip/ s/^/#/; s,^dbpath=.*,dbpath=%s,' %s" %
       (data_dir,
        vm.GetPathToConfig('mongodb_server')))
+  if FLAGS.mongodb_readahead_kb is not None:
+    vm.SetReadAhead(FLAGS.mongodb_readahead_kb * 2,
+                    [d.GetDevicePath() for d in vm.scratch_disks])
   vm.RemoteCommand('sudo service %s restart' %
                    vm.GetServiceName('mongodb_server'))
 
@@ -96,6 +102,7 @@ def Prepare(benchmark_spec):
                      for client in benchmark_spec.vm_groups['clients']]
 
   vm_util.RunThreaded((lambda f: f()), server_partials + client_partials)
+  benchmark_spec.executor = ycsb.YCSBExecutor('mongodb', cp=ycsb.YCSB_DIR)
 
 
 def Run(benchmark_spec):
@@ -108,14 +115,16 @@ def Run(benchmark_spec):
   Returns:
     A list of sample.Sample objects.
   """
-
-  executor = ycsb.YCSBExecutor('mongodb', cp=ycsb.YCSB_DIR)
   server = benchmark_spec.vm_groups['workers'][0]
   kwargs = {
       'mongodb.url': 'mongodb://%s:27017/' % server.internal_ip,
       'mongodb.writeConcern': FLAGS.mongodb_writeconcern}
-  samples = list(executor.LoadAndRun(benchmark_spec.vm_groups['clients'],
-                                     load_kwargs=kwargs, run_kwargs=kwargs))
+  samples = list(benchmark_spec.executor.LoadAndRun(
+      benchmark_spec.vm_groups['clients'],
+      load_kwargs=kwargs, run_kwargs=kwargs))
+  if FLAGS.mongodb_readahead_kb is not None:
+    for s in samples:
+      s.metadata['readahdead_kb'] = FLAGS.mongodb_readahead_kb
   return samples
 
 
@@ -131,4 +140,4 @@ def Cleanup(benchmark_spec):
                          server.GetServiceName('mongodb_server'))
     server.RemoteCommand('rm -rf %s' % _GetDataDir(server))
 
-  vm_util.RunThreaded(CleanupServer, benchmark_spec.vm_groups['workers'][0])
+  CleanupServer(benchmark_spec.vm_groups['workers'][0])

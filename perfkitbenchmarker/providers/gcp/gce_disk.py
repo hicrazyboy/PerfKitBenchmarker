@@ -21,8 +21,8 @@ import json
 
 from perfkitbenchmarker import disk
 from perfkitbenchmarker import flags
-from perfkitbenchmarker.providers.gcp import util
 from perfkitbenchmarker.providers import GCP
+from perfkitbenchmarker.providers.gcp import util
 
 FLAGS = flags.FLAGS
 
@@ -35,19 +35,19 @@ DISK_METADATA = {
     PD_STANDARD: {
         disk.MEDIA: disk.HDD,
         disk.REPLICATION: disk.ZONE,
-        disk.LEGACY_DISK_TYPE: disk.STANDARD
     },
     PD_SSD: {
         disk.MEDIA: disk.SSD,
         disk.REPLICATION: disk.ZONE,
-        disk.LEGACY_DISK_TYPE: disk.REMOTE_SSD
     },
     disk.LOCAL: {
         disk.MEDIA: disk.SSD,
         disk.REPLICATION: disk.NONE,
-        disk.LEGACY_DISK_TYPE: disk.LOCAL
     }
 }
+
+SCSI = 'SCSI'
+NVME = 'NVME'
 
 disk.RegisterDiskTypeMap(GCP, DISK_TYPE)
 
@@ -55,14 +55,18 @@ disk.RegisterDiskTypeMap(GCP, DISK_TYPE)
 class GceDisk(disk.BaseDisk):
   """Object representing an GCE Disk."""
 
-  def __init__(self, disk_spec, name, zone, project, image=None):
+  def __init__(self, disk_spec, name, zone, project,
+               image=None, image_project=None):
     super(GceDisk, self).__init__(disk_spec)
     self.attached_vm_name = None
     self.image = image
+    self.image_project = image_project
     self.name = name
     self.zone = zone
     self.project = project
-    self.metadata = DISK_METADATA[disk_spec.disk_type]
+    self.metadata.update(DISK_METADATA[disk_spec.disk_type])
+    if self.disk_type == disk.LOCAL:
+      self.metadata['interface'] = FLAGS.gce_ssd_interface
 
   def _Create(self):
     """Creates the disk."""
@@ -71,9 +75,10 @@ class GceDisk(disk.BaseDisk):
     cmd.flags['type'] = self.disk_type
     if self.image:
       cmd.flags['image'] = self.image
-      if FLAGS.image_project:
-        cmd.flags['image-project'] = FLAGS.image_project
-    cmd.Issue()
+    if self.image_project:
+      cmd.flags['image-project'] = self.image_project
+    _, stderr, retcode = cmd.Issue()
+    util.CheckGcloudResponseKnownFailures(stderr, retcode)
 
   def _Delete(self):
     """Deletes the disk."""
@@ -113,4 +118,7 @@ class GceDisk(disk.BaseDisk):
 
   def GetDevicePath(self):
     """Returns the path to the device inside the VM."""
-    return '/dev/disk/by-id/google-%s' % self.name
+    if FLAGS.gce_ssd_interface == SCSI:
+      return '/dev/disk/by-id/google-%s' % self.name
+    elif FLAGS.gce_ssd_interface == NVME:
+      return '/dev/%s' % self.name

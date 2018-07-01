@@ -14,11 +14,43 @@
 """Utilities for working with Google Cloud Platform resources."""
 
 from collections import OrderedDict
+import json
+import logging
+import re
+import functools32
 
+from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import vm_util
 
 FLAGS = flags.FLAGS
+
+
+@functools32.lru_cache()
+def GetDefaultProject():
+  """Get the default project."""
+  cmd = [FLAGS.gcloud_path, 'config', 'list', '--format=json']
+  stdout, _, _ = vm_util.IssueCommand(cmd)
+  result = json.loads(stdout)
+  return result['core']['project']
+
+
+def GetRegionFromZone(zone):
+  return zone[:-2]
+
+
+def GetMultiRegionFromRegion(region):
+  """Gets the closest multi-region location to the region."""
+  if (region.startswith('us') or
+      region.startswith('northamerica') or
+      region.startswith('southamerica')):
+    return 'us'
+  elif region.startswith('europe'):
+    return 'eu'
+  elif region.startswith('asia') or region.startswith('australia'):
+    return 'asia'
+  else:
+    raise Exception('Unknown region "%s".' % region)
 
 
 class GcloudCommand(object):
@@ -110,6 +142,51 @@ class GcloudCommand(object):
     self.flags['quiet'] = True
     if resource.project is not None:
       self.flags['project'] = resource.project
-    if hasattr(resource, 'zone'):
+    if hasattr(resource, 'zone') and resource.zone:
       self.flags['zone'] = resource.zone
     self.additional_flags.extend(FLAGS.additional_gcloud_flags or ())
+
+
+_QUOTA_EXCEEDED_REGEX = re.compile('Quota \'.*\' exceeded.')
+_QUOTA_EXCEEDED_MESSAGE = ('Creation failed due to quota exceeded: ')
+
+_NOT_ENOUGH_RESOURCES_STDERR = ('does not have enough resources available to '
+                                'fulfill the request.')
+_NOT_ENOUGH_RESOURCES_MESSAGE = 'Creation failed due to not enough resources: '
+
+
+def CheckGcloudResponseKnownFailures(stderr, retcode):
+  """Checks gcloud responses for quota exceeded errors.
+
+  Args:
+      stderr: The stderr from a gcloud command.
+      retcode: The return code from a gcloud command.
+  """
+  if retcode and _QUOTA_EXCEEDED_REGEX.search(stderr):
+    message = _QUOTA_EXCEEDED_MESSAGE + stderr
+    logging.error(message)
+    raise errors.Benchmarks.QuotaFailure(message)
+  if retcode and _NOT_ENOUGH_RESOURCES_STDERR in stderr:
+    message = _NOT_ENOUGH_RESOURCES_MESSAGE + stderr
+    logging.error(message)
+    raise errors.Benchmarks.InsufficientCapacityCloudFailure(message)
+
+
+def AuthenticateServiceAccount(vm, vm_gcloud_path='gcloud'):
+  """Authorize gcloud to access Cloud Platform with a Google service account.
+
+  If you want gcloud (and other tools in the Cloud SDK) to use service account
+  credentials to make requests, use this method to authenticate.
+  Account name is provided by FLAGS.gcp_service_account
+  Credentials are fetched from a file whose local path is provided by
+  FLAGS.gcp_service_account_key_filethat. It contains private authorization key.
+
+  Args:
+    vm: vm on which the gcloud library needs to be authenticated.
+    vm_gcloud_path: Optional path to the gcloud binary on the vm.
+  """
+  vm.PushFile(FLAGS.gcp_service_account_key_file)
+  activate_cmd = ('{} auth activate-service-account {} --key-file={}'
+                  .format(vm_gcloud_path, FLAGS.gcp_service_account,
+                          FLAGS.gcp_service_account_key_file.split('/')[-1]))
+  vm.RemoteCommand(activate_cmd)

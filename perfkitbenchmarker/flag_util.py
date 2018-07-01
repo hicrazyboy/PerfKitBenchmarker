@@ -1,4 +1,4 @@
-# Copyright 2015 PerfKitBenchmarker Authors. All rights reserved.
+# Copyright 2017 PerfKitBenchmarker Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,25 +25,30 @@ from perfkitbenchmarker import units
 
 FLAGS = flags.FLAGS
 
-INTEGER_GROUP_REGEXP = re.compile(r'(\d+)(-(\d+))?$')
+INTEGER_GROUP_REGEXP = re.compile(r'(\d+)(-(\d+))?(-(\d+))?$')
+INTEGER_GROUP_REGEXP_COLONS = re.compile(r'(-?\d+)(:(-?\d+))?(:(-?\d+))?$')
 
 
 class IntegerList(object):
   """An immutable list of nonnegative integers.
 
   The list contains either single integers (ex: 5) or ranges (ex:
-  8-12). The list can include as many elements as will fit in
+  8-12). Additionally, the user can provide a step to the range like so:
+  8-24-2. The list can include as many elements as will fit in
   memory. Furthermore, the memory required to hold a range will not
   grow with the size of the range.
 
   Make a list with
     lst = IntegerList(groups)
 
-  where groups is a list whose elements are either single integers or
+  where groups is a list whose elements are either single integers,
   2-tuples holding the low and high bounds of a range
-  (inclusive). (Ex: [5, (8,12)] represents the integer list
-  5,8,9,10,11,12.)
+  (inclusive), or 3-tuples holding the low and high bounds, followed
+  by the step size. (Ex: [5, (8,12)] represents the integer list
+  5,8,9,10,11,12, and [(8-14-2)] represents the list 8,10,12,14.)
 
+  For negative number ranges use a colon seperator (ex: "-2:1" is the integer
+  list -2, -1, 0, 1).
   """
 
   def __init__(self, groups):
@@ -54,7 +59,7 @@ class IntegerList(object):
       if isinstance(elt, int) or isinstance(elt, long):
         length += 1
       if isinstance(elt, tuple):
-        length += elt[1] - elt[0] + 1
+        length += len(self._CreateXrangeFromTuple(elt))
 
     self.length = length
 
@@ -75,36 +80,52 @@ class IntegerList(object):
         group_idx += 1
         idx -= 1
       else:
-        group_len = group[1] - group[0] + 1
+        group_len = len(self._CreateXrangeFromTuple(group))
         if idx >= group_len:
           group_idx += 1
           idx -= group_len
         else:
-          return group[0] + idx
+          step = 1 if len(group) == 2 else group[2]
+          return group[0] + idx * step
 
     if isinstance(self.groups[group_idx], tuple):
       return self.groups[group_idx][0]
     else:
       return self.groups[group_idx]
 
+  def __eq__(self, other):
+    return tuple(self) == tuple(other)
+
+  def __ne__(self, other):
+    return tuple(self) != tuple(other)
+
   def __iter__(self):
     for group in self.groups:
       if isinstance(group, int) or isinstance(group, long):
         yield group
       else:
-        low, high = group
-        for val in xrange(low, high + 1):
+        for val in self._CreateXrangeFromTuple(group):
           yield val
 
   def __str__(self):
-      return IntegerListSerializer().Serialize(self)
+    return IntegerListSerializer().serialize(self)
+
+  def __repr__(self):
+    return 'IntegerList([%s])' % self
+
+  def _CreateXrangeFromTuple(self, input_tuple):
+    start = input_tuple[0]
+    step = 1 if len(input_tuple) == 2 else input_tuple[2]
+    stop_inclusive = input_tuple[1] + (1 if step > 0 else -1)
+    return xrange(start, stop_inclusive, step)
 
 
 class IntegerListParser(flags.ArgumentParser):
   """Parse a string containing a comma-separated list of nonnegative integers.
 
   The list may contain single integers and dash-separated ranges. For
-  example, "1,3,5-7" parses to [1,3,5,6,7].
+  example, "1,3,5-7" parses to [1,3,5,6,7] and "1-7-3" parses to
+  [1,4,7].
 
   Can pass the flag on_nonincreasing to the constructor to tell it
   what to do if the list is nonincreasing. Options are
@@ -115,10 +136,13 @@ class IntegerListParser(flags.ArgumentParser):
   As a special case, instead of a string, can pass a list of integers
   or an IntegerList. In these cases, the return value iterates over
   the same integers as were in the argument.
+
+  For negative number ranges use a colon seperator, for example "-3:4:2" parses
+  to [-3, -1, 1, 3].
   """
 
-  syntactic_help = ('A comma-separated list of nonnegative integers or integer '
-                    'ranges. Ex: 1,3,5-7 is read as 1,3,5,6,7.')
+  syntactic_help = ('A comma-separated list of integers or integer '
+                    'ranges. Ex: -1,3,5:7 is read as -1,3,5,6,7.')
 
   WARN = 'warn'
   EXCEPTION = 'exception'
@@ -128,7 +152,7 @@ class IntegerListParser(flags.ArgumentParser):
 
     self.on_nonincreasing = on_nonincreasing
 
-  def Parse(self, inp):
+  def parse(self, inp):
     """Parse an integer list.
 
     Args:
@@ -138,13 +162,15 @@ class IntegerListParser(flags.ArgumentParser):
       An iterable of integers.
 
     Raises:
-      ValueError if inp doesn't follow a format it recognizes.
+      ValueError: if inp doesn't follow a format it recognizes.
     """
 
     if isinstance(inp, IntegerList):
       return inp
     elif isinstance(inp, list):
       return IntegerList(inp)
+    elif isinstance(inp, int):
+      return IntegerList([inp])
 
     def HandleNonIncreasing():
       if self.on_nonincreasing == IntegerListParser.WARN:
@@ -156,7 +182,8 @@ class IntegerListParser(flags.ArgumentParser):
     result = []
 
     for group in groups:
-      match = INTEGER_GROUP_REGEXP.match(group)
+      match = INTEGER_GROUP_REGEXP.match(
+          group) or INTEGER_GROUP_REGEXP_COLONS.match(group)
       if match is None:
         raise ValueError('Invalid integer list %s', inp)
       elif match.group(2) is None:
@@ -169,22 +196,29 @@ class IntegerListParser(flags.ArgumentParser):
       else:
         low = int(match.group(1))
         high = int(match.group(3))
+        step = int(match.group(5)) if match.group(5) is not None else 1
+        step = -step if step > 0 and low > high else step
 
         if high <= low or (len(result) > 0 and low <= result[-1]):
           HandleNonIncreasing()
 
-        result.append((low, high))
+        result.append((low, high, step))
 
     return IntegerList(result)
 
-  def Type(self):
+  def flag_type(self):
     return 'integer list'
 
 
 class IntegerListSerializer(flags.ArgumentSerializer):
-  def Serialize(self, il):
+
+  def _SerializeRange(self, val):
+    separator = ':' if any(item < 0 for item in val) else '-'
+    return separator.join(str(item) for item in val)
+
+  def serialize(self, il):
     return ','.join([str(val) if isinstance(val, int) or isinstance(val, long)
-                     else '%s-%s' % (val[0], val[1])
+                     else self._SerializeRange(val)
                      for val in il.groups])
 
 
@@ -213,15 +247,17 @@ class FlagDictSubstitution(object):
     """
     self._flags = flag_values
     self._substitute = substitute
+    self._flag_dict_func_name = (
+        '_flags' if hasattr(self._flags, '_flags') else 'FlagDict')
 
   def __enter__(self):
     """Begins the flag substitution."""
-    self._original_flagdict = self._flags.FlagDict
-    self._flags.__dict__['FlagDict'] = self._substitute
+    self._original_flagdict = getattr(self._flags, self._flag_dict_func_name)
+    self._flags.__dict__[self._flag_dict_func_name] = self._substitute
 
   def __exit__(self, *unused_args, **unused_kwargs):
     """Stops the flag substitution."""
-    self._flags.__dict__['FlagDict'] = self._original_flagdict
+    self._flags.__dict__[self._flag_dict_func_name] = self._original_flagdict
 
 
 class UnitsParser(flags.ArgumentParser):
@@ -244,7 +280,7 @@ class UnitsParser(flags.ArgumentParser):
       convertible_to: Either an individual unit specification or a series of
           unit specifications, where each unit specification is either a string
           (e.g. 'byte') or a units.Unit. The parser input must be convertible to
-          at least one of the specified Units, or the Parse() method will raise
+          at least one of the specified Units, or the parse() method will raise
           a ValueError.
     """
     if isinstance(convertible_to, (basestring, units.Unit)):
@@ -252,7 +288,7 @@ class UnitsParser(flags.ArgumentParser):
     else:
       self.convertible_to = [units.Unit(u) for u in convertible_to]
 
-  def Parse(self, inp):
+  def parse(self, inp):
     """Parse the input.
 
     Args:
@@ -292,7 +328,7 @@ class UnitsParser(flags.ArgumentParser):
 
 
 class UnitsSerializer(flags.ArgumentSerializer):
-  def Serialize(self, units):
+  def serialize(self, units):
     return str(units)
 
 
@@ -308,7 +344,7 @@ def DEFINE_units(name, default, help, convertible_to,
         specifications, where each unit specification is either a string (e.g.
         'byte') or a units.Unit. The flag value must be convertible to at least
         one of the specified Units to be considered valid.
-    flag_values: the gflags.FlagValues object to define the flag in.
+    flag_values: the absl.flags.FlagValues object to define the flag in.
   """
   parser = UnitsParser(convertible_to=convertible_to)
   serializer = UnitsSerializer()
@@ -390,7 +426,7 @@ class YAMLParser(flags.ArgumentParser):
 
   syntactic_help = 'A YAML expression.'
 
-  def Parse(self, inp):
+  def parse(self, inp):
     """Parse the input.
 
     Args:
@@ -418,7 +454,7 @@ class YAMLParser(flags.ArgumentParser):
 
 class YAMLSerializer(flags.ArgumentSerializer):
 
-  def Serialize(self, val):
+  def serialize(self, val):
     return yaml.dump(val)
 
 
@@ -429,8 +465,8 @@ def DEFINE_yaml(name, default, help, flag_values=flags.FLAGS, **kwargs):
     name: string. The name of the flag.
     default: object. The default value of the flag.
     help: string. A help message for the user.
-    flag_values: the gflags.FlagValues object to define the flag in.
-    kwargs: extra arguments to pass to gflags.DEFINE().
+    flag_values: the absl.flags.FlagValues object to define the flag in.
+    kwargs: extra arguments to pass to absl.flags.DEFINE().
   """
 
   parser = YAMLParser()
@@ -454,10 +490,19 @@ def ParseKeyValuePairs(strings):
   pairs = {}
   for pair in [kv for s in strings for kv in s.split(',')]:
     try:
-      key, value = pair.split(':')
+      key, value = pair.split(':', 1)
       pairs[key] = value
     except ValueError:
       logging.error('Bad key value pair format. Skipping "%s".', pair)
       continue
 
   return pairs
+
+
+def GetProvidedCommandLineFlags():
+  """Return flag names and values that were specified on the command line.
+
+  Returns:
+    A dictionary of provided flags in the form: {flag_name: flag_value}.
+  """
+  return {k: FLAGS[k].value for k in FLAGS if FLAGS[k].present}

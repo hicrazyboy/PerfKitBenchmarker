@@ -1,6 +1,6 @@
 #!/usr/bin/env python2
 #
-# Copyright 2015 PerfKitBenchmarker Authors. All rights reserved.
+# Copyright 2017 PerfKitBenchmarker Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,8 +22,14 @@ Blocks until a command wrapped by "execute_command.py" completes, then mimics
 the wrapped command, copying the wrapped command's stdout/stderr to this
 process' stdout/stderr, and exiting with the wrapped command's status.
 
+If passed the path to the status file, but not the stdout and stderr files,
+this script will block until command completion, then print
+'Command finished.' before returning with status 0.
+
 *Runs on the guest VM. Supports Python 2.6, 2.7, and 3.x.*
 """
+
+from __future__ import print_function
 
 import fcntl
 import optparse
@@ -31,6 +37,10 @@ import os
 import shutil
 import sys
 import threading
+import time
+
+WAIT_TIMEOUT_IN_SEC = 120.0
+WAIT_SLEEP_IN_SEC = 5.0
 
 
 def main():
@@ -50,7 +60,7 @@ def main():
     return 1
 
   missing = []
-  for option in ('stdout', 'stderr', 'status'):
+  for option in ('status',):
     if getattr(options, option) is None:
       missing.append(option)
 
@@ -61,16 +71,28 @@ def main():
     sys.stderr.write(msg)
     return 1
 
-  with open(options.stdout, 'r') as stdout:
-    with open(options.stderr, 'r') as stderr:
+  start = time.time()
+  return_code_str = None
+  while (time.time() < WAIT_TIMEOUT_IN_SEC + start):
+    try:
       with open(options.status, 'r') as status:
         fcntl.lockf(status, fcntl.LOCK_SH)
         return_code_str = status.read()
+        break
+    except IOError:
+      print('WARNING: file doesn\'t exist, retrying', file=sys.stderr)
+      time.sleep(WAIT_SLEEP_IN_SEC)
 
+  if not (options.stdout and options.stderr):
+    print('Command finished.')
+    return 0
+
+  with open(options.stdout, 'r') as stdout:
+    with open(options.stderr, 'r') as stderr:
       if return_code_str:
         return_code = int(return_code_str)
       else:
-        print >> sys.stderr, 'WARNING: wrapper script interrupted.'
+        print('WARNING: wrapper script interrupted.', file=sys.stderr)
         return_code = 1
 
       stderr_copier = threading.Thread(target=shutil.copyfileobj,

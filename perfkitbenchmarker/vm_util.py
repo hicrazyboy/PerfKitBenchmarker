@@ -17,6 +17,7 @@
 import contextlib
 import logging
 import os
+import platform
 import random
 import re
 import string
@@ -54,11 +55,14 @@ FUZZ = .5
 MAX_RETRIES = -1
 
 WINDOWS = 'nt'
+DARWIN = 'Darwin'
 PASSWORD_LENGTH = 15
 
 OUTPUT_STDOUT = 0
 OUTPUT_STDERR = 1
 OUTPUT_EXIT_CODE = 2
+
+_SIMULATE_MAINTENANCE_SEMAPHORE = threading.Semaphore(0)
 
 flags.DEFINE_integer('default_timeout', TIMEOUT, 'The default timeout for '
                      'retryable commands in seconds.')
@@ -74,6 +78,12 @@ flags.DEFINE_integer('background_network_mbits_per_sec', None,
                      'Number of megabits per second of background '
                      'network traffic to generate during the run phase '
                      'of the benchmark')
+flags.DEFINE_boolean('simulate_maintenance', False,
+                     'Whether to simulate VM maintenance during the benchmark. '
+                     'This requires both benchmark and provider support.')
+flags.DEFINE_integer('simulate_maintenance_delay', 0,
+                     'The number of seconds to wait to start simulating '
+                     'maintenance.')
 
 
 class IpAddressSubset(object):
@@ -164,7 +174,7 @@ def GetCertPath():
   return PrependTempDir(CERT_FILE)
 
 
-def GetSshOptions(ssh_key_filename):
+def GetSshOptions(ssh_key_filename, connect_timeout=5):
   """Return common set of SSH and SCP options."""
   options = [
       '-2',
@@ -173,7 +183,7 @@ def GetSshOptions(ssh_key_filename):
       '-o', 'IdentitiesOnly=yes',
       '-o', 'PreferredAuthentications=publickey',
       '-o', 'PasswordAuthentication=no',
-      '-o', 'ConnectTimeout=5',
+      '-o', 'ConnectTimeout=%d' % connect_timeout,
       '-o', 'GSSAPIAuthentication=no',
       '-o', 'ServerAliveInterval=30',
       '-o', 'ServerAliveCountMax=10',
@@ -205,7 +215,7 @@ def Retry(poll_interval=POLL_INTERVAL, max_retries=MAX_RETRIES,
     timeout: The timeout for all tries in seconds. If -1, this means continue
         until max_retries is met. The function will stop retrying when either
         max_retries is met or timeout is reached.
-    fuzz: The ammount of randomness in the sleep time. This is used to
+    fuzz: The amount of randomness in the sleep time. This is used to
         keep threads from all retrying at the same time. At 0, this
         means sleep exactly poll_interval seconds. At 1, this means
         sleep anywhere from 0 to poll_interval seconds.
@@ -242,17 +252,17 @@ def Retry(poll_interval=POLL_INTERVAL, max_retries=MAX_RETRIES,
           sleep_time = poll_interval * fuzz_multiplier
           if ((time.time() + sleep_time) >= deadline or
               (max_retries >= 0 and tries > max_retries)):
-            raise e
+            raise
           else:
             if log_errors:
-              logging.error('Got exception running %s: %s', f.__name__, e)
+              logging.info('Retrying exception running %s: %s', f.__name__, e)
             time.sleep(sleep_time)
     return WrappedFunction
   return Wrap
 
 
 def IssueCommand(cmd, force_info_log=False, suppress_warning=False,
-                 env=None, timeout=DEFAULT_TIMEOUT, input=None):
+                 env=None, timeout=DEFAULT_TIMEOUT, cwd=None):
   """Tries running the provided command once.
 
   Args:
@@ -273,20 +283,38 @@ def IssueCommand(cmd, force_info_log=False, suppress_warning=False,
         return code will indicate an error, and stdout and stderr will
         contain what had already been written to them before the process was
         killed.
+    cwd: Directory in which to execute the command.
 
   Returns:
     A tuple of stdout, stderr, and retcode from running the provided command.
   """
-  logging.debug('Environment variables: %s' % env)
+  if env:
+    logging.debug('Environment variables: %s', env)
 
   full_cmd = ' '.join(cmd)
   logging.info('Running: %s', full_cmd)
 
-  shell_value = RunningOnWindows()
-  with tempfile.TemporaryFile() as tf_out, tempfile.TemporaryFile() as tf_err:
-    process = subprocess.Popen(cmd, env=env, shell=shell_value,
+  time_file_path = '/usr/bin/time'
+
+  running_on_windows = RunningOnWindows()
+  running_on_darwin = RunningOnDarwin()
+  should_time = (not (running_on_windows or running_on_darwin) and
+                 os.path.isfile(time_file_path) and FLAGS.time_commands)
+  shell_value = running_on_windows
+  with tempfile.TemporaryFile() as tf_out, \
+      tempfile.TemporaryFile() as tf_err, \
+      tempfile.NamedTemporaryFile(mode='r') as tf_timing:
+
+    cmd_to_use = cmd
+    if should_time:
+      cmd_to_use = [time_file_path,
+                    '-o', tf_timing.name,
+                    '--quiet',
+                    '-f', ',  WallTime:%Es,  CPU:%Us,  MaxMemory:%Mkb '] + cmd
+
+    process = subprocess.Popen(cmd_to_use, env=env, shell=shell_value,
                                stdin=subprocess.PIPE, stdout=tf_out,
-                               stderr=tf_err)
+                               stderr=tf_err, cwd=cwd)
 
     def _KillProcess():
       logging.error('IssueCommand timed out after %d seconds. '
@@ -306,8 +334,12 @@ def IssueCommand(cmd, force_info_log=False, suppress_warning=False,
     tf_err.seek(0)
     stderr = tf_err.read().decode('ascii', 'ignore')
 
-  debug_text = ('Ran %s. Got return code (%s).\nSTDOUT: %s\nSTDERR: %s' %
-                (full_cmd, process.returncode, stdout, stderr))
+    timing_output = ''
+    if should_time:
+      timing_output = tf_timing.read().rstrip('\n')
+
+  debug_text = ('Ran: {%s}  ReturnCode:%s%s\nSTDOUT: %s\nSTDERR: %s' %
+                (full_cmd, process.returncode, timing_output, stdout, stderr))
   if force_info_log or (process.returncode and not suppress_warning):
     logging.info(debug_text)
   else:
@@ -326,7 +358,7 @@ def IssueBackgroundCommand(cmd, stdout_path, stderr_path, env=None):
     env: A dict of key/value strings, such as is given to the subprocess.Popen()
         constructor, that contains environment variables to be injected.
   """
-  logging.debug('Environment variables: %s' % env)
+  logging.debug('Environment variables: %s', env)
 
   full_cmd = ' '.join(cmd)
   logging.info('Spawning: %s', full_cmd)
@@ -359,6 +391,10 @@ def IssueRetryableCommand(cmd, env=None):
 def ParseTimeCommandResult(command_result):
   """Parse command result and get time elapsed.
 
+  Note this parses the output of bash's time builtin, not /usr/bin/time or other
+  implementations. You may need to run something like bash -c "time ./command"
+  to produce parseable output.
+
   Args:
      command_result: The result after executing a remote time command.
 
@@ -368,7 +404,6 @@ def ParseTimeCommandResult(command_result):
   time_data = re.findall(r'real\s+(\d+)m(\d+.\d+)', command_result)
   time_in_seconds = 60 * float(time_data[0][0]) + float(time_data[0][1])
   return time_in_seconds
-
 
 
 def ShouldRunOnExternalIpAddress():
@@ -475,6 +510,11 @@ def RunningOnWindows():
   return os.name == WINDOWS
 
 
+def RunningOnDarwin():
+  """Returns True if PKB is running on a Darwin OS machine."""
+  return os.name != WINDOWS and platform.system() == DARWIN
+
+
 def ExecutableOnPath(executable_name):
   """Return True if the given executable can be found on the path."""
   cmd = ['where'] if RunningOnWindows() else ['which']
@@ -509,3 +549,21 @@ def GenerateRandomWindowsPassword(password_length=PASSWORD_LENGTH):
   password.append(random.choice(string.digits))
   password.append(random.choice(special_chars))
   return ''.join(password)
+
+
+def StartSimulatedMaintenance():
+  """Initiates the simulated maintenance event."""
+  if FLAGS.simulate_maintenance:
+    _SIMULATE_MAINTENANCE_SEMAPHORE.release()
+
+
+def SetupSimulatedMaintenance(vm):
+  """Called ready VM for simulated maintenance."""
+  if FLAGS.simulate_maintenance:
+    def _SimulateMaintenance():
+      _SIMULATE_MAINTENANCE_SEMAPHORE.acquire()
+      time.sleep(FLAGS.simulate_maintenance_delay)
+      vm.SimulateMaintenanceEvent()
+    t = threading.Thread(target=_SimulateMaintenance)
+    t.daemon = True
+    t.start()

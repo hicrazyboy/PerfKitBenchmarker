@@ -28,6 +28,8 @@ from perfkitbenchmarker import flags
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import units
 
+from perfkitbenchmarker.linux_packages import multichase
+
 
 _CHASES_WITHOUT_ARGS = (
     'simple', 'incr', 't0', 't1', 't2', 'nta', 'movdqa', 'movntdqa',
@@ -44,8 +46,6 @@ _CHASES = {c: c in _CHASES_WITH_ARGS
            for c in _CHASES_WITHOUT_ARGS + _CHASES_WITH_ARGS}
 
 _BENCHMARK_SPECIFIC_VM_STATE_ATTR = 'multichase_vm_state'
-_GIT_PATH = 'https://github.com/google/multichase'
-_GIT_VERSION = '8a00c4006d253c6aa5079f5e702279ee20e0df68'
 
 BENCHMARK_NAME = 'multichase'
 BENCHMARK_CONFIG = """
@@ -72,7 +72,7 @@ class _MemorySizeParser(flag_util.UnitsParser):
     super(_MemorySizeParser, self).__init__(convertible_to=(units.byte,
                                                             units.percent))
 
-  def Parse(self, inp):
+  def parse(self, inp):
     """Parse the input.
 
     Args:
@@ -85,7 +85,7 @@ class _MemorySizeParser(flag_util.UnitsParser):
       ValueError: If the input cannot be parsed, or if it parses to a value that
           does not meet the requirements described in self.syntactic_help.
     """
-    size = super(_MemorySizeParser, self).Parse(inp)
+    size = super(_MemorySizeParser, self).parse(inp)
     if size.units != units.percent:
       size_byte_count = size.to(units.byte).magnitude
       if size_byte_count != int(size_byte_count):
@@ -115,10 +115,10 @@ flags.DEFINE_integer(
     'Argument to refine the chase type specified with --multichase_chase_type. '
     'Applicable for the following types: {0}.'.format(', '.join(
         _CHASES_WITH_ARGS)))
-flags.DEFINE_integer(
-    'multichase_thread_count', 1,
+flag_util.DEFINE_integerlist(
+    'multichase_thread_count', flag_util.IntegerList([1]),
     'Number of threads (one per core), to use when executing multichase. '
-    'Passed to multichase via its -t flag.')
+    'Passed to multichase via its -t flag.', module_name=__name__)
 _DefineMemorySizeFlag(
     'multichase_memory_size_min', _DEFAULT_MEMORY_SIZE,
     'Memory size to use when executing multichase. Passed to multichase via '
@@ -205,7 +205,7 @@ def GetConfig(user_config):
   return configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
 
 
-def CheckPrerequisites():
+def CheckPrerequisites(benchmark_config):
   """Performs input verification checks.
 
   Raises:
@@ -244,15 +244,13 @@ def Prepare(benchmark_spec):
   vm = benchmark_spec.vms[0]
   vm_state = _MultichaseSpecificState()
   setattr(vm, _BENCHMARK_SPECIFIC_VM_STATE_ATTR, vm_state)
-  vm.Install('build_tools')
+  vm.Install('multichase')
   remote_benchmark_dir = '_'.join(('pkb', FLAGS.run_uri, benchmark_spec.uid))
   vm.RemoteCommand('mkdir ' + remote_benchmark_dir)
   vm_state.dir = remote_benchmark_dir
   vm_state.multichase_dir = posixpath.join(vm_state.dir, 'multichase')
-  vm.RemoteCommand('git clone --recursive {git_path} {dir}'.format(
-      dir=vm_state.multichase_dir, git_path=_GIT_PATH))
-  vm.RemoteCommand('cd {dir} && git checkout {version} && make'.format(
-      dir=vm_state.multichase_dir, version=_GIT_VERSION))
+  vm.RemoteCommand('cp -ar {0} {1}'.format(
+                   multichase.INSTALL_PATH, vm_state.multichase_dir))
 
 
 def Run(benchmark_spec):
@@ -267,8 +265,7 @@ def Run(benchmark_spec):
   samples = []
   base_metadata = {'additional_flags': FLAGS.multichase_additional_flags,
                    'chase_type': FLAGS.multichase_chase_type,
-                   'multichase_version': _GIT_VERSION,
-                   'thread_count': FLAGS.multichase_thread_count}
+                   'multichase_version': multichase.GIT_VERSION}
   vm = benchmark_spec.vms[0]
   vm_state = getattr(vm, _BENCHMARK_SPECIFIC_VM_STATE_ATTR)
 
@@ -285,29 +282,32 @@ def Run(benchmark_spec):
     chase_type = '{0}:{1}'.format(chase_type, FLAGS.multichase_chase_arg)
     base_metadata['chase_arg'] = FLAGS.multichase_chase_arg
   base_cmd.extend(('-c', chase_type))
-  base_cmd.extend(('-t', FLAGS.multichase_thread_count))
 
-  memory_size_iterator = _IterMemorySizes(
-      lambda: vm.total_memory_kb * 1024, FLAGS.multichase_memory_size_min,
-      FLAGS.multichase_memory_size_max)
-  for memory_size in memory_size_iterator:
-    stride_size_iterator = _IterMemorySizes(
-        lambda: memory_size, FLAGS.multichase_stride_size_min,
-        FLAGS.multichase_stride_size_max)
-    for stride_size in stride_size_iterator:
-      cmd = ' '.join(str(s) for s in itertools.chain(base_cmd, (
-          '-m', memory_size, '-s', stride_size,
-          FLAGS.multichase_additional_flags)))
-      stdout, _ = vm.RemoteCommand(cmd)
+  for thread_count in FLAGS.multichase_thread_count:
+    if thread_count > vm.num_cpus:
+      continue
+    memory_size_iterator = _IterMemorySizes(
+        lambda: vm.total_memory_kb * 1024, FLAGS.multichase_memory_size_min,
+        FLAGS.multichase_memory_size_max)
+    for memory_size in memory_size_iterator:
+      stride_size_iterator = _IterMemorySizes(
+          lambda: memory_size, FLAGS.multichase_stride_size_min,
+          FLAGS.multichase_stride_size_max)
+      for stride_size in stride_size_iterator:
+        cmd = ' '.join(str(s) for s in itertools.chain(base_cmd, (
+            '-m', memory_size, '-s', stride_size, '-t', thread_count,
+            FLAGS.multichase_additional_flags)))
+        stdout, _ = vm.RemoteCommand(cmd)
 
-      # Latency is printed in ns in the last line.
-      latency_ns = float(stdout.split()[-1])
+        # Latency is printed in ns in the last line.
+        latency_ns = float(stdout.split()[-1])
 
-      # Generate one sample from one run of multichase.
-      metadata = base_metadata.copy()
-      metadata.update({'memory_size_bytes': memory_size,
-                       'stride_size_bytes': stride_size})
-      samples.append(sample.Sample('latency', latency_ns, 'ns', metadata))
+        # Generate one sample from one run of multichase.
+        metadata = base_metadata.copy()
+        metadata.update({'memory_size_bytes': memory_size,
+                         'stride_size_bytes': stride_size,
+                         'thread_count': thread_count})
+        samples.append(sample.Sample('latency', latency_ns, 'ns', metadata))
 
   return samples
 

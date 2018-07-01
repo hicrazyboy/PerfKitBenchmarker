@@ -21,10 +21,6 @@ Compared to hbase_ycsb, this benchmark:
   * Modifies hbase-site.xml to work with Cloud Bigtable.
   * Adds the Bigtable client JAR.
   * Adds netty-tcnative-boringssl, used for communication with Bigtable.
-
-This benchmark requires a Cloud Bigtable cluster to be provisioned before
-running.
-The benchmark will fail if the specified cluster is not found.
 """
 
 import json
@@ -32,7 +28,6 @@ import logging
 import os
 import pipes
 import posixpath
-import re
 import subprocess
 
 from perfkitbenchmarker import configs
@@ -47,26 +42,25 @@ from perfkitbenchmarker.providers.gcp import gcp_bigtable
 
 FLAGS = flags.FLAGS
 
-HBASE_VERSION = re.match(r'(\d+\.\d+)\.?\d*', hbase.HBASE_VERSION).group(1)
-
-BIGTABLE_CLIENT_VERSION = '0.2.4'
+HBASE_CLIENT_VERSION = '1.1'
+BIGTABLE_CLIENT_VERSION = '0.9.0'
 
 flags.DEFINE_string('google_bigtable_endpoint', 'bigtable.googleapis.com',
                     'Google API endpoint for Cloud Bigtable.')
 flags.DEFINE_string('google_bigtable_admin_endpoint',
-                    'bigtabletableadmin.googleapis.com',
+                    'bigtableadmin.googleapis.com',
                     'Google API endpoint for Cloud Bigtable table '
                     'administration.')
 flags.DEFINE_string('google_bigtable_zone_name', 'us-central1-b',
                     'Bigtable zone.')
-flags.DEFINE_string('google_bigtable_cluster_name', None,
-                    'Bigtable cluster name.')
+flags.DEFINE_string('google_bigtable_instance_name', None,
+                    'Bigtable instance name.')
 flags.DEFINE_string(
     'google_bigtable_hbase_jar_url',
     'https://oss.sonatype.org/service/local/repositories/releases/content/'
     'com/google/cloud/bigtable/bigtable-hbase-{0}/'
     '{1}/bigtable-hbase-{0}-{1}.jar'.format(
-        HBASE_VERSION,
+        HBASE_CLIENT_VERSION,
         BIGTABLE_CLIENT_VERSION),
     'URL for the Bigtable-HBase client JAR.')
 
@@ -75,7 +69,7 @@ BENCHMARK_CONFIG = """
 cloud_bigtable_ycsb:
   description: >
       Run YCSB against an existing Cloud Bigtable
-      cluster. Configure the number of client VMs via --num_vms.
+      instance. Configure the number of client VMs via --num_vms.
   vm_groups:
     default:
       vm_spec: *default_single_core
@@ -92,8 +86,9 @@ TCNATIVE_BORINGSSL_URL = (
     'netty-tcnative-boringssl-static-1.1.33.Fork13-linux-x86_64.jar')
 HBASE_SITE = 'cloudbigtable/hbase-site.xml.j2'
 HBASE_CONF_FILES = [HBASE_SITE]
-YCSB_HBASE_LIB = posixpath.join(ycsb.YCSB_DIR, 'hbase-binding', 'lib')
-YCSB_HBASE_CONF = posixpath.join(ycsb.YCSB_DIR, 'hbase-binding', 'conf')
+HBASE_BINDING = 'hbase10-binding'
+YCSB_HBASE_LIB = posixpath.join(ycsb.YCSB_DIR, HBASE_BINDING, 'lib')
+YCSB_HBASE_CONF = posixpath.join(ycsb.YCSB_DIR, HBASE_BINDING, 'conf')
 
 REQUIRED_SCOPES = (
     'https://www.googleapis.com/auth/bigtable.admin',
@@ -110,7 +105,7 @@ def GetConfig(user_config):
   return configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
 
 
-def CheckPrerequisites():
+def CheckPrerequisites(benchmark_config):
   """Verifies that the required resources are present.
 
   Raises:
@@ -127,44 +122,46 @@ def CheckPrerequisites():
       raise ValueError('Scope {0} required.'.format(scope))
 
   # TODO: extract from gcloud config if available.
-  if FLAGS.google_bigtable_cluster_name:
-    cluster = _GetClusterDescription(FLAGS.project or _GetDefaultProject(),
-                                     FLAGS.google_bigtable_zone_name,
-                                     FLAGS.google_bigtable_cluster_name)
-    logging.info('Found cluster: %s', cluster)
+  if FLAGS.google_bigtable_instance_name:
+    instance = _GetInstanceDescription(FLAGS.project or _GetDefaultProject(),
+                                       FLAGS.google_bigtable_instance_name)
+    logging.info('Found instance: %s', instance)
   else:
-    logging.info('No cluster; will create in Prepare.')
+    logging.info('No instance; will create in Prepare.')
 
 
-def _GetClusterDescription(project, zone, cluster_name):
-  """Gets the description for a Cloud Bigtable cluster.
+def _GetInstanceDescription(project, instance_name):
+  """Gets the description for a Cloud Bigtable instance.
 
   Args:
-    project: str. Name of the project in which the cluster was created.
-    zone: str. Zone of the project in which the cluster was created.
-    cluster_name: str. Cluster ID of the desired Bigtable cluster.
+    project: str. Name of the project in which the instance was created.
+    instance_name: str. ID of the desired Bigtable instance.
 
   Returns:
-    A dictionary containing a cluster description.
+    A dictionary containing an instance description.
 
   Raises:
-    KeyError: when the cluster was not found.
+    KeyError: when the instance was not found.
   """
   env = {'CLOUDSDK_CORE_DISABLE_PROMPTS': '1'}
   env.update(os.environ)
-  cmd = [FLAGS.gcloud_path, 'alpha', 'bigtable', 'clusters', 'list', '--quiet',
+  # List clusters and get the cluster associated with this instance so we can
+  # read the number of nodes in the cluster.
+  cmd = [FLAGS.gcloud_path, 'beta', 'bigtable', 'clusters', 'list', '--quiet',
          '--format', 'json', '--project', project]
   stdout, stderr, returncode = vm_util.IssueCommand(cmd, env=env)
   if returncode:
     raise IOError('Command "{0}" failed:\nSTDOUT:\n{1}\nSTDERR:\n{2}'.format(
         ' '.join(cmd), stdout, stderr))
   result = json.loads(stdout)
-  clusters = {cluster['clusterId']: cluster for cluster in result}
+  instances = {
+      instance['name'].split('/')[3]: instance for instance in result
+  }
   try:
-    return clusters[cluster_name]
+    return instances[instance_name]
   except KeyError:
-    raise KeyError('Cluster {0} not found in {1}'.format(
-        cluster_name, list(clusters)))
+    raise KeyError('Instance {0} not found in {1}'.format(
+        instance_name, list(instances)))
 
 
 def _GetTableName():
@@ -191,8 +188,8 @@ def _Install(vm):
   vm.Install('ycsb')
   vm.Install('curl')
 
-  cluster_name = (FLAGS.google_bigtable_cluster_name or
-                  'pkb-bigtable-{0}'.format(FLAGS.run_uri))
+  instance_name = (FLAGS.google_bigtable_instance_name or
+                   'pkb-bigtable-{0}'.format(FLAGS.run_uri))
   hbase_lib = posixpath.join(hbase.HBASE_DIR, 'lib')
   for url in [FLAGS.google_bigtable_hbase_jar_url, TCNATIVE_BORINGSSL_URL]:
     jar_name = os.path.basename(url)
@@ -207,9 +204,8 @@ def _Install(vm):
       'google_bigtable_endpoint': FLAGS.google_bigtable_endpoint,
       'google_bigtable_admin_endpoint': FLAGS.google_bigtable_admin_endpoint,
       'project': FLAGS.project or _GetDefaultProject(),
-      'cluster': cluster_name,
-      'zone': FLAGS.google_bigtable_zone_name,
-      'hbase_version': HBASE_VERSION.replace('.', '_')
+      'instance': instance_name,
+      'hbase_version': HBASE_CLIENT_VERSION.replace('.', '_')
   }
 
   for file_name in HBASE_CONF_FILES:
@@ -232,28 +228,39 @@ def Prepare(benchmark_spec):
   benchmark_spec.always_call_cleanup = True
   vms = benchmark_spec.vms
 
-  # TODO: in the future, it might be nice to chagne this so that
-  # a gcp_bigtable.GcpBigtableCluster can be created with an
-  # flag that says don't create/delete the cluster.  That would
+  # TODO: in the future, it might be nice to change this so that
+  # a gcp_bigtable.GcpBigtableInstance can be created with an
+  # flag that says don't create/delete the instance.  That would
   # reduce the code paths here.
-  if FLAGS.google_bigtable_cluster_name is None:
-    cluster_name = 'pkb-bigtable-{0}'.format(FLAGS.run_uri)
+  if FLAGS.google_bigtable_instance_name is None:
+    instance_name = 'pkb-bigtable-{0}'.format(FLAGS.run_uri)
     project = FLAGS.project or _GetDefaultProject()
-    logging.info('Creating bigtable cluster %s', cluster_name)
+    logging.info('Creating bigtable instance %s', instance_name)
     zone = FLAGS.google_bigtable_zone_name
-    benchmark_spec.bigtable_cluster = gcp_bigtable.GcpBigtableCluster(
-        cluster_name, CLUSTER_SIZE, project, zone)
-    benchmark_spec.bigtable_cluster.Create()
-    cluster = _GetClusterDescription(project,
-                                     FLAGS.google_bigtable_zone_name,
-                                     cluster_name)
-    logging.info('Cluster %s created successfully', cluster)
+    benchmark_spec.bigtable_instance = gcp_bigtable.GcpBigtableInstance(
+        instance_name, CLUSTER_SIZE, project, zone)
+    benchmark_spec.bigtable_instance.Create()
+    instance = _GetInstanceDescription(project, instance_name)
+    logging.info('Instance %s created successfully', instance)
 
   vm_util.RunThreaded(_Install, vms)
 
   # Create table
   hbase_ycsb.CreateYCSBTable(vms[0], table_name=_GetTableName(),
                              use_snappy=False, limit_filesize=False)
+
+  table_name = _GetTableName()
+
+  # Add hbase conf dir to the classpath.
+  ycsb_memory = min(vms[0].total_memory_kb // 1024, 4096)
+  jvm_args = pipes.quote(' -Xmx{0}m'.format(ycsb_memory))
+
+  executor_flags = {
+      'cp': hbase.HBASE_CONF_DIR,
+      'jvm-args': jvm_args,
+      'table': table_name}
+
+  benchmark_spec.executor = ycsb.YCSBExecutor('hbase10', **executor_flags)
 
 
 def Run(benchmark_spec):
@@ -268,25 +275,13 @@ def Run(benchmark_spec):
   """
   vms = benchmark_spec.vms
 
-  table_name = _GetTableName()
-
-  # Add hbase conf dir to the classpath.
-  ycsb_memory = ycsb_memory = min(vms[0].total_memory_kb // 1024, 4096)
-  jvm_args = pipes.quote(' -Xmx{0}m'.format(ycsb_memory))
-
-  executor_flags = {'cp': hbase.HBASE_CONF_DIR,
-                    'jvm-args': jvm_args,
-                    'table': table_name}
-
-  executor = ycsb.YCSBExecutor('hbase-10', **executor_flags)
-  cluster_name = (FLAGS.google_bigtable_cluster_name or
-                  'pkb-bigtable-{0}'.format(FLAGS.run_uri))
-  cluster_info = _GetClusterDescription(FLAGS.project or _GetDefaultProject(),
-                                        FLAGS.google_bigtable_zone_name,
-                                        cluster_name)
+  instance_name = (FLAGS.google_bigtable_instance_name or
+                   'pkb-bigtable-{0}'.format(FLAGS.run_uri))
+  instance_info = _GetInstanceDescription(
+      FLAGS.project or _GetDefaultProject(), instance_name)
 
   metadata = {'ycsb_client_vms': len(vms),
-              'bigtable_nodes': cluster_info.get('serveNodes')}
+              'bigtable_nodes': instance_info.get('serveNodes')}
 
   # By default YCSB uses a BufferedMutator for Puts / Deletes.
   # This leads to incorrect update latencies, since since the call returns
@@ -302,9 +297,8 @@ def Run(benchmark_spec):
   load_kwargs['clientbuffering'] = 'true'
   if not FLAGS['ycsb_preload_threads'].present:
     load_kwargs['threads'] = 1
-  samples = list(executor.LoadAndRun(vms,
-                                     load_kwargs=load_kwargs,
-                                     run_kwargs=run_kwargs))
+  samples = list(benchmark_spec.executor.LoadAndRun(
+      vms, load_kwargs=load_kwargs, run_kwargs=run_kwargs))
   for sample in samples:
     sample.metadata.update(metadata)
 
@@ -319,10 +313,10 @@ def Cleanup(benchmark_spec):
         required to run the benchmark.
   """
  # Delete table
-  if FLAGS.google_bigtable_cluster_name is None:
-    benchmark_spec.bigtable_cluster.Delete()
+  if FLAGS.google_bigtable_instance_name is None:
+    benchmark_spec.bigtable_instance.Delete()
   else:
-    # Only need to drop the tables if we're not deleting the cluster.
+    # Only need to drop the tables if we're not deleting the instance.
     vm = benchmark_spec.vms[0]
     command = ("""echo 'disable "{0}"; drop "{0}"; exit' | """
                """{1}/hbase shell""").format(_GetTableName(), hbase.HBASE_BIN)

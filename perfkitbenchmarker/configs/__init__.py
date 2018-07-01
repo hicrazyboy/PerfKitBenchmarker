@@ -23,6 +23,8 @@ specify which benchmarks to run in the same config file.
 Valid top level keys:
   benchmarks: A YAML array of dictionaries mapping benchmark names to their
       configs. This also determines which benchmarks to run.
+  flags: A YAML dictionary with overrides for default flag values. Benchmark
+      config specific flags override those specified here.
   *any_benchmark_name*: If the 'benchmarks' key is not specified, then
       specifying a benchmark name mapped to a config will override
       that benchmark's default configuration in the event that that
@@ -60,8 +62,11 @@ VM specs, disk specs, or any component of the benchmark configuration
 dictionary.
 """
 
+import contextlib2
 import copy
+import functools32
 import logging
+import re
 import yaml
 
 from perfkitbenchmarker import data
@@ -70,6 +75,8 @@ from perfkitbenchmarker import flags
 
 FLAGS = flags.FLAGS
 CONFIG_CONSTANTS = 'default_config_constants.yaml'
+FLAGS_KEY = 'flags'
+IMPORT_REGEX = re.compile('^#import (.*)')
 
 flags.DEFINE_string('benchmark_config_file', None,
                     'The file path to the user config file which will '
@@ -77,19 +84,85 @@ flags.DEFINE_string('benchmark_config_file', None,
                     'a path relative to the current working directory, '
                     'an absolute path, or just the name of a file in the '
                     'configs/ directory.')
-flags.DEFINE_multistring(
+flags.DEFINE_multi_string(
     'config_override', None,
     'This flag can be used to override any config value. It is applied after '
     'the user config (specified via --benchmark_config_file_path), so it has '
     'a higher priority than that config. The value of the flag should be '
     'fully.qualified.key=value (e.g. --config_override=cluster_boot.vm_groups.'
-    'default.vm_count=4). This flag can be repeated.')
+    'default.vm_count=4).')
+
+
+class _ConcatenatedFiles(object):
+  """Class that presents several files as a single object.
+
+  The class exposes a single method (read) which is all that yaml
+  needs to interact with a stream.
+
+  Attributes:
+    files: A list of opened file objects.
+    current_file_index: The index of the current file that is being read from.
+  """
+
+  def __init__(self, files):
+    self.files = files
+    self.current_file_index = 0
+
+  def read(self, length):
+    data = self.files[self.current_file_index].read(length)
+    while (not data) and (self.current_file_index + 1 < len(self.files)):
+      self.current_file_index += 1
+      data = self.files[self.current_file_index].read(length)
+    return data
+
+
+def _GetImportFiles(config_file, imported_set=None):
+  """Get a list of file names that get imported from config_file.
+
+  Args:
+    config_file: The name of a config file to find imports for.
+    imported_set: A set of files that _GetImportFiles has already
+        been called on that should be ignored.
+
+  Returns:
+    A list of file names that are imported by config_file
+    (including config_file itself).
+  """
+  imported_set = imported_set or set()
+  config_path = data.ResourcePath(config_file)
+  # Give up on circular imports.
+  if config_path in imported_set:
+    return []
+  imported_set.add(config_path)
+
+  with open(config_path) as f:
+    line = f.readline()
+    match = IMPORT_REGEX.match(line)
+    import_files = []
+    while match:
+      import_file = match.group(1)
+      for file_name in _GetImportFiles(import_file, imported_set):
+        if file_name not in import_files:
+          import_files.append(file_name)
+      line = f.readline()
+      match = IMPORT_REGEX.match(line)
+    import_files.append(config_path)
+    return import_files
 
 
 def _LoadUserConfig(path):
   """Loads a user config from the supplied path."""
-  with open(data.ResourcePath(path)) as fp:
-    return yaml.load(fp.read())
+  config_files = _GetImportFiles(path)
+  with contextlib2.ExitStack() as stack:
+    files = [stack.enter_context(open(f)) for f in config_files]
+    return yaml.load(_ConcatenatedFiles(files))
+
+
+@functools32.lru_cache()
+def _LoadConfigConstants():
+  """Reads the config constants file."""
+  with open(data.ResourcePath(CONFIG_CONSTANTS, False)) as fp:
+    return fp.read()
 
 
 def _GetConfigFromOverrides(overrides):
@@ -109,6 +182,12 @@ def _GetConfigFromOverrides(overrides):
     config = MergeConfigs(config, new_config)
 
   return config
+
+
+@functools32.lru_cache()
+def GetConfigFlags():
+  """Returns the global flags from the user config."""
+  return GetUserConfig().get(FLAGS_KEY, {})
 
 
 def GetUserConfig():
@@ -171,7 +250,7 @@ def MergeConfigs(default_config, override_config, warn_new_key=False):
           logging.warning('The key "%s" was not in the default config, '
                           'but was in user overrides. This may indicate '
                           'a typo.' % k)
-      elif isinstance(v, dict):
+      elif isinstance(d1[k], dict) and isinstance(v, dict):
         merged_dict[k] = _Merge(d1[k], v)
       else:
         merged_dict[k] = v
@@ -198,8 +277,7 @@ def LoadMinimalConfig(benchmark_config, benchmark_name):
     dict. The loaded config.
   """
   yaml_config = []
-  with open(data.ResourcePath(CONFIG_CONSTANTS, False)) as fp:
-    yaml_config.append(fp.read())
+  yaml_config.append(_LoadConfigConstants())
   yaml_config.append(benchmark_config)
 
   try:

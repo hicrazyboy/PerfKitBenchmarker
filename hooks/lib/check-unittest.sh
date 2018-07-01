@@ -17,14 +17,14 @@
 set -euo pipefail
 
 if [[ -z $(command -v tox) ]]; then
-  >&2 echo "Missing tox. Install it via 'pip' to enable unit testing."
+  >&2 echo "Missing tox >= 2.0.0. Install it via 'pip' to enable unit testing."
   exit 1
 fi
 
 # Unit test failures can't easily be mapped to specific input files.
 # Always run all tests, and report a failure via nonzero exit code if
 # any test fails.
-if ! tox -e py27,scripttests >&2; then
+if ! tox -e py27,scripts >&2; then
   >&2 echo "*** tox failed. Note: If dependencies have changed, try "\
     "running 'tox -r' to update the tox environment"
   exit 1

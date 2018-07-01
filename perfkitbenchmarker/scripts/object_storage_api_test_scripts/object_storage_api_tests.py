@@ -26,22 +26,19 @@ import cStringIO
 import json
 import logging
 import os
-import Queue
 import sys
+import multiprocessing as mp
 from threading import Thread
-import threading
 import string
 import random
 import time
 
 import yaml
 
-import gflags as flags
-import gcs_oauth2_boto_plugin  # noqa
+from absl import flags
 
-import azure_service
-import gcs
-import s3
+import azure_flags  # noqa
+import s3_flags  # noqa
 
 FLAGS = flags.FLAGS
 
@@ -83,6 +80,8 @@ flags.DEFINE_string('object_sizes', "{1024: 100.0}", 'The size of the objects '
 flags.DEFINE_integer('num_streams', 10, 'The number of streams to use. Only '
                      'applies to the MultiStreamThroughput scenario.',
                      lower_bound=1)
+flags.DEFINE_integer('stream_num_start', 1, 'The number of the first thread in '
+                     'this process.')
 flags.DEFINE_string('objects_written_file', None, 'The path where the '
                     'multistream write benchmark will save a list of the '
                     'objects it wrote, and the multistream read benchmark will '
@@ -98,6 +97,17 @@ flags.DEFINE_string('object_storage_class', None, 'The storage class to use '
                     'for uploads. Currently only applicable to AWS. For other '
                     'providers, storage class is determined by the bucket, '
                     'which is passed in by the --bucket parameter.')
+
+flags.DEFINE_enum('object_naming_scheme', 'sequential_by_stream',
+                  ['sequential_by_stream',
+                   'approximately_sequential'],
+                  'How objects will be named. Only applies to the '
+                  'MultiStreamWrite benchmark. '
+                  'sequential_by_stream: object names from each stream '
+                  'will be sequential, but different streams will have '
+                  'different name prefixes. '
+                  'approximately_sequential: object names from all '
+                  'streams will roughly increase together.')
 
 STORAGE_TO_SCHEMA_DICT = {'GCS': 'gs', 'S3': 's3', 'AZURE': 'azure'}
 
@@ -248,6 +258,51 @@ def PercentileCalculator(numbers):
       result['stddev'] = 0
 
   return result
+
+# ### Object naming schemes ###
+
+
+class ObjectNameIterator(object):
+  """Provides new object names on demand.
+
+  This class exists to easily support different object naming schemes.
+  """
+
+  def __iter__(self):
+    """The iterator for this iterator.
+
+    This method is required by the Python iterator protocol.
+    """
+    return self
+
+  def next(self):
+    """Generate a new name.
+
+    Returns:
+      The object name, as a string.
+    """
+
+    raise NotImplementedError()
+
+
+class PrefixCounterIterator(ObjectNameIterator):
+  def __init__(self, prefix):
+    self.prefix = prefix
+    self.counter = 0
+
+  def next(self):
+    name = '%s_%d' % (self.prefix, self.counter)
+    self.counter = self.counter + 1
+    return name
+
+
+class PrefixTimestampSuffixIterator(ObjectNameIterator):
+  def __init__(self, prefix, suffix):
+    self.prefix = prefix
+    self.suffix = suffix
+
+  def next(self):
+    return '%s_%f_%s' % (self.prefix, time.time(), self.suffix)
 
 
 # ### Utilities for benchmarking ###
@@ -518,58 +573,44 @@ def SingleStreamThroughputBenchmark(service):
     service.DeleteObjects(FLAGS.bucket, objects_written)
 
 
-def RunThreadedWorkers(worker, worker_args, per_thread_args=None):
-  """Run a worker function in many threads, then gather and return the results.
+def RunWorkerProcesses(worker, worker_args, per_process_args=None):
+  """Run a worker function in many processes, then gather and return the results
 
   Args:
     worker: either WriteWorker or ReadWorker. The worker function to call.
     worker_args: a tuple. The arguments to pass to the worker function. The
       result queue and stream number will be appended as the last two arguments.
-    per_thread_args: if given, an array with length equal to the
-      number of threads. Thread number i will be passed
-      per_thread_args[i] after its regular arguments and before the
+    per_process_args: if given, an array with length equal to the
+      number of processes. Process number i will be passed
+      per_process_args[i] after its regular arguments and before the
       result queue and stream number.
 
   Returns:
     A list of the results returned by the workers.
   """
 
-  result_queue = Queue.Queue()
+  result_queue = mp.Queue()
+  num_streams = FLAGS.num_streams
 
-  logging.info('Creating %s threads', FLAGS.num_streams)
-  if per_thread_args is None:
-    threads = [threading.Thread(target=worker,
-                                args=worker_args + (result_queue, i))
-               for i in xrange(FLAGS.num_streams)]
+  logging.info('Creating %s processes', FLAGS.num_streams)
+  if per_process_args is None:
+    processes = [mp.Process(target=worker,
+                            args=worker_args + (result_queue, i))
+                 for i in xrange(num_streams)]
   else:
-    threads = [threading.Thread(target=worker,
-                                args=worker_args +
-                                (per_thread_args[i],) +
-                                (result_queue, i))
-               for i in xrange(FLAGS.num_streams)]
-  logging.info('Threads created. Starting threads.')
-  for thread in threads:
-    thread.start()
-  logging.info('Threads started.')
-  while True:
-    time.sleep(THREAD_STATUS_LOG_INTERVAL)
-    num_alive = sum((thread.isAlive() for thread in threads))
-    if num_alive == 0:
-      break
-    else:
-      logging.info('%s of %s threads are still working.',
-                   num_alive, FLAGS.num_streams)
-  logging.info('All threads complete.')
+    processes = [mp.Process(target=worker,
+                            args=worker_args +
+                            (per_process_args[i],) +
+                            (result_queue, i))
+                 for i in xrange(num_streams)]
+  logging.info('Processes created. Starting processes.')
+  for process in processes:
+    process.start()
+  logging.info('Processes started.')
 
-  results = []
-
-  try:
-    while True:
-      res = result_queue.get_nowait()
-      results.append(res)
-  except Queue.Empty:
-    pass
-
+  # Wait for all the results. Each worker will put one result onto the queue
+  results = [result_queue.get() for _ in range(num_streams)]
+  logging.info('All processes complete.')
   return results
 
 
@@ -596,8 +637,8 @@ def MultiStreamWrites(service):
 
   [{"operation": "upload", "start_time": start_time_1,
     "latency": latency_1, "size": size_1, "stream_num": stream_num_1},
-   [{"operation": "upload", "start_time": start_time_2,
-    "latency": latency_2, "size": size_2, "stream_num": stream_num_2}
+   {"operation": "upload", "start_time": start_time_2,
+    "latency": latency_2, "size": size_2, "stream_num": stream_num_2},
    ...]
 
   Both kinds of output are written as JSON, for easy serialization and
@@ -609,13 +650,14 @@ def MultiStreamWrites(service):
 
   payload = GenerateWritePayload(MaxSizeInDistribution(size_distribution))
 
-  results = RunThreadedWorkers(
+  results = RunWorkerProcesses(
       WriteWorker,
       (service,
        payload,
        size_distribution,
        FLAGS.objects_per_stream,
-       FLAGS.start_time))
+       FLAGS.start_time,
+       FLAGS.object_naming_scheme))
 
   # object_records is the data we leave on the VM for future reads. We
   # need to pass data to the reader so it will know what object names
@@ -634,30 +676,25 @@ def MultiStreamWrites(service):
       # If we can't write our objects written, we still want to return
       # the data we collected, so keep going.
       logging.info('Got exception %s while trying to write objects written '
-                   'file.', ex.msg)
+                   'file.', ex)
 
-  # operation_records is the data we send back to the controller.
-  operation_records = []
+  logging.info('len(results) = %s', len(results))
+
+  # streams is the data we send back to the controller.
+  streams = []
   for result in results:
-    operation = result['operation']
-    stream_num = result['stream_num']
-    for start_time, latency, size in zip(result['start_times'],
-                                         result['latencies'],
-                                         result['sizes']):
-      operation_records.append({'operation': operation,
-                                'start_time': start_time,
-                                'latency': latency,
-                                'size': size,
-                                'stream_num': stream_num})
+    result_keys = ('stream_num', 'start_times', 'latencies', 'sizes')
+    streams.append({k: result[k] for k in result_keys})
 
+  num_writes = sum([len(stream['start_times']) for stream in streams])
   num_writes_requested = FLAGS.objects_per_stream * FLAGS.num_streams
   min_writes_required = num_writes_requested * (1.0 - FAILURE_TOLERANCE)
-  if len(operation_records) < min_writes_required:
+  if num_writes < min_writes_required:
     raise LowAvailabilityError(
         'Wrote %s objects out of %s requested (%s requred)' %
-        (len(operation_records), num_writes_requested, min_writes_required))
+        (num_writes, num_writes_requested, min_writes_required))
 
-  json.dump(operation_records, sys.stdout, indent=0)
+  json.dump(streams, sys.stdout, indent=0)
 
 
 def MultiStreamReads(service):
@@ -694,34 +731,27 @@ def MultiStreamReads(service):
   objects_by_worker = [object_records[i::num_workers]
                        for i in xrange(num_workers)]
 
-  results = RunThreadedWorkers(
+  results = RunWorkerProcesses(
       ReadWorker,
       (service,
        FLAGS.start_time),
-      per_thread_args=objects_by_worker)
+      per_process_args=objects_by_worker)
 
-  # send data back to the controller
-  operation_records = []
+  # streams is the data we send back to the controller.
+  streams = []
   for result in results:
-    operation = result['operation']
-    stream_num = result['stream_num']
-    for start_time, latency, size in zip(result['start_times'],
-                                         result['latencies'],
-                                         result['sizes']):
-      operation_records.append({'operation': operation,
-                                'stream_num': stream_num,
-                                'start_time': start_time,
-                                'latency': latency,
-                                'size': size})
+    result_keys = ('stream_num', 'start_times', 'latencies', 'sizes')
+    streams.append({k: result[k] for k in result_keys})
 
-  num_reads_requested = len(object_records)
+  num_reads = sum([len(stream['start_times']) for stream in streams])
+  num_reads_requested = FLAGS.objects_per_stream * FLAGS.num_streams
   min_reads_required = num_reads_requested * (1.0 - FAILURE_TOLERANCE)
-  if len(operation_records) < min_reads_required:
+  if num_reads < min_reads_required:
     raise LowAvailabilityError(
         'Read %s objects out of %s requested (%s requred)' %
-        (len(operation_records), num_reads_requested, min_reads_required))
+        (num_reads, num_reads_requested, min_reads_required))
 
-  json.dump(operation_records, sys.stdout, indent=0)
+  json.dump(streams, sys.stdout, indent=0)
 
 
 def SleepUntilTime(when):
@@ -743,7 +773,7 @@ def SleepUntilTime(when):
 
 def WriteWorker(service, payload,
                 size_distribution, num_objects,
-                start_time, result_queue, worker_num):
+                start_time, naming_scheme, result_queue, worker_num):
   """Upload objects for the multi-stream writes benchmark.
 
   Args:
@@ -752,7 +782,8 @@ def WriteWorker(service, payload,
     size_distribution: the distribution of object sizes to use.
     num_objects: the number of objects to upload.
     start_time: a POSIX timestamp. When to start uploading.
-    result_queue: a Queue.Queue to record results in.
+    naming_scheme: how to name objects. See flag.
+    result_queue: a mp.Queue to record results in.
     worker_num: the thread number of this worker.
   """
 
@@ -761,8 +792,14 @@ def WriteWorker(service, payload,
   latencies = []
   sizes = []
 
+  if naming_scheme == 'sequential_by_stream':
+    name_iterator = PrefixCounterIterator(
+        'pkb_write_worker_%f_%s' % (time.time(), worker_num))
+  elif naming_scheme == 'approximately_sequential':
+    name_iterator = PrefixTimestampSuffixIterator(
+        'pkb_writes_%s' % start_time,
+        '%s' % worker_num)
   size_iterator = SizeDistributionIterator(size_distribution)
-  object_prefix = ('pkb_write_worker_%f_%s' % (time.time(), worker_num))
 
   payload_handle = cStringIO.StringIO(payload)
 
@@ -770,7 +807,7 @@ def WriteWorker(service, payload,
     SleepUntilTime(start_time)
 
   for i in xrange(num_objects):
-    object_name = '%s_%d' % (object_prefix, i)
+    object_name = name_iterator.next()
     object_size = size_iterator.next()
 
     try:
@@ -786,12 +823,13 @@ def WriteWorker(service, payload,
       logging.info('Worker %s caught exception %s while writing object %s' %
                    (worker_num, e, object_name))
 
-  result_queue.put({'operation': 'upload',
-                    'object_names': object_names,
+  logging.info('Worker %s finished writing its objects' % worker_num)
+
+  result_queue.put({'object_names': object_names,
                     'start_times': start_times,
                     'latencies': latencies,
                     'sizes': sizes,
-                    'stream_num': worker_num})
+                    'stream_num': worker_num + FLAGS.stream_num_start})
 
 
 def ReadWorker(service, start_time, object_records,
@@ -816,11 +854,10 @@ def ReadWorker(service, start_time, object_records,
                    (worker_num, e, name))
 
 
-  result_queue.put({'operation': 'download',
-                    'start_times': start_times,
+  result_queue.put({'start_times': start_times,
                     'latencies': latencies,
                     'sizes': sizes,
-                    'stream_num': worker_num})
+                    'stream_num': worker_num + FLAGS.stream_num_start})
 
 
 def OneByteRWBenchmark(service):
@@ -1013,25 +1050,12 @@ def ListConsistencyBenchmark(service):
   return final_result
 
 
-# Although this dictionary does not really fit in this file, moving it
-# out of this file would require either adding a registry to
-# object_storage_interface.py or adding a new module. The improvement
-# in organization of moving it doesn't seem worth the extra
-# complexity.
-_STORAGE_TO_SERVICE_DICT = {
-    'AZURE': azure_service.AzureService,
-    'GCS': gcs.GCSService,
-    'S3': s3.S3Service
-}
-
-
 def Main(argv=sys.argv):
-
   logging.basicConfig(level=logging.INFO)
 
   try:
     argv = FLAGS(argv)  # parse flags
-  except flags.FlagsError as e:
+  except flags.Error as e:
     logging.error(
         '%s\nUsage: %s ARGS\n%s', e, sys.argv[0], FLAGS)
     sys.exit(1)
@@ -1044,7 +1068,20 @@ def Main(argv=sys.argv):
                FLAGS.bucket,
                FLAGS.scenario)
 
-  service = _STORAGE_TO_SERVICE_DICT[FLAGS.storage_provider]()
+  # This is essentially a dictionary lookup implemented in if
+  # statements, but doing it this way allows us to not import the
+  # modules of storage providers we're not using.
+  if FLAGS.storage_provider == 'AZURE':
+    import azure_service
+    service = azure_service.AzureService()
+  elif FLAGS.storage_provider == 'GCS':
+    import gcs
+    service = gcs.GCSService()
+  elif FLAGS.storage_provider == 'S3':
+    import s3
+    service = s3.S3Service()
+  else:
+    raise ValueError('Invalid storage provider %s' % FLAGS.storage_provider)
 
   if FLAGS.storage_provider == 'AZURE':
       # There are DNS lookup issues with the provider Azure when doing

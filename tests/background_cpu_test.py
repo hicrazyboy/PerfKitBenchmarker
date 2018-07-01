@@ -26,6 +26,7 @@ from perfkitbenchmarker import context
 from perfkitbenchmarker import os_types
 from perfkitbenchmarker import providers
 from perfkitbenchmarker.configs import benchmark_config_spec
+from perfkitbenchmarker.providers.gcp import util
 from perfkitbenchmarker.linux_benchmarks import ping_benchmark
 from tests import mock_flags
 
@@ -59,13 +60,17 @@ class TestBackgroundWorkload(unittest.TestCase):
     self._mocked_flags = mock_flags.PatchTestCaseFlags(self)
     self._mocked_flags.cloud = providers.GCP
     self._mocked_flags.os_type = os_types.DEBIAN
+    self._mocked_flags.temp_dir = 'tmp'
+    p = patch(util.__name__ + '.GetDefaultProject')
+    p.start()
     self.addCleanup(context.SetThreadBenchmarkSpec, None)
+    self.addCleanup(p.stop)
 
   def _CreateBenchmarkSpec(self, benchmark_config_yaml):
     config = configs.LoadConfig(benchmark_config_yaml, {}, NAME)
     config_spec = benchmark_config_spec.BenchmarkConfigSpec(
         NAME, flag_values=self._mocked_flags, **config)
-    return benchmark_spec.BenchmarkSpec(config_spec, NAME, UID)
+    return benchmark_spec.BenchmarkSpec(ping_benchmark, config_spec, UID)
 
   def _CheckVmCallCounts(self, spec, working_groups, working_expected_counts,
                          non_working_groups, non_working_expected_counts):
@@ -110,8 +115,8 @@ class TestBackgroundWorkload(unittest.TestCase):
 
   def testWindowsVMCausesError(self):
     """ windows vm with background_cpu_threads raises exception """
-    self._mocked_flags['background_cpu_threads'].Parse(1)
-    self._mocked_flags['os_type'].Parse(os_types.WINDOWS)
+    self._mocked_flags['background_cpu_threads'].parse(1)
+    self._mocked_flags['os_type'].parse(os_types.WINDOWS)
     spec = self._CreateBenchmarkSpec(ping_benchmark.BENCHMARK_CONFIG)
     spec.ConstructVirtualMachines()
     with self.assertRaisesRegexp(Exception, 'NotImplementedError'):
@@ -123,7 +128,7 @@ class TestBackgroundWorkload(unittest.TestCase):
 
   def testBackgroundWorkloadVM(self):
     """ Check that the background_cpu_threads causes calls """
-    self._mocked_flags['background_cpu_threads'].Parse(1)
+    self._mocked_flags['background_cpu_threads'].parse(1)
     spec = self._CreateBenchmarkSpec(ping_benchmark.BENCHMARK_CONFIG)
     spec.ConstructVirtualMachines()
     self._CheckVMFromSpec(spec, working_groups=(_GROUP_1, _GROUP_2))
@@ -139,7 +144,7 @@ class TestBackgroundWorkload(unittest.TestCase):
 
   def testBackgroundWorkloadWindows(self):
     """ Test that nothing happens with the vanilla config """
-    self._mocked_flags['os_type'].Parse(os_types.WINDOWS)
+    self._mocked_flags['os_type'].parse(os_types.WINDOWS)
     spec = self._CreateBenchmarkSpec(ping_benchmark.BENCHMARK_CONFIG)
     spec.ConstructVirtualMachines()
     for vm in spec.vms:
@@ -149,7 +154,7 @@ class TestBackgroundWorkload(unittest.TestCase):
 
   def testBackgroundWorkloadVanillaConfigFlag(self):
     """ Check that the background_cpu_threads flags overrides the config """
-    self._mocked_flags['background_cpu_threads'].Parse(2)
+    self._mocked_flags['background_cpu_threads'].parse(2)
     spec = self._CreateBenchmarkSpec(ping_benchmark.BENCHMARK_CONFIG)
     spec.ConstructVirtualMachines()
     for vm in spec.vms:

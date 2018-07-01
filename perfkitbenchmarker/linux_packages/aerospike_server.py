@@ -15,25 +15,32 @@
 
 """Module containing aerospike server installation and cleanup functions."""
 
-import time
+import logging
 
 from perfkitbenchmarker import data
-from perfkitbenchmarker import disk
+from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import vm_util
+from perfkitbenchmarker.linux_packages import INSTALL_DIR
 
 FLAGS = flags.FLAGS
 
 GIT_REPO = 'https://github.com/aerospike/aerospike-server.git'
-GIT_TAG = '3.7.5'
-AEROSPIKE_DIR = '%s/aerospike-server' % vm_util.VM_TMP_DIR
+GIT_TAG = '4.0.0.1'
+AEROSPIKE_DIR = '%s/aerospike-server' % INSTALL_DIR
 AEROSPIKE_CONF_PATH = '%s/as/etc/aerospike_dev.conf' % AEROSPIKE_DIR
+
+AEROSPIKE_DEFAULT_TELNET_PORT = 3003
 
 MEMORY = 'memory'
 DISK = 'disk'
 flags.DEFINE_enum('aerospike_storage_type', MEMORY, [MEMORY, DISK],
                   'The type of storage to use for Aerospike data. The type of '
                   'disk is controlled by the "data_disk_type" flag.')
+flags.DEFINE_integer('aerospike_replication_factor', 1,
+                     'Replication factor for aerospike server.')
+flags.DEFINE_integer('aerospike_transaction_threads_per_queue', 4,
+                     'Number of threads per transaction queue.')
 
 
 def _Install(vm):
@@ -56,6 +63,54 @@ def AptInstall(vm):
   _Install(vm)
 
 
+@vm_util.Retry(poll_interval=5, timeout=300,
+               retryable_exceptions=(errors.Resource.RetryableCreationError))
+def _WaitForServerUp(server):
+  """Block until the Aerospike server is up and responsive.
+
+  Will timeout after 5 minutes, and raise an exception. Before the timeout
+  expires any exceptions are caught and the status check is retried.
+
+  We check the status of the server by connecting to Aerospike's out
+  of band telnet management port and issue a 'status' command. This should
+  return 'ok' if the server is ready. Per the aerospike docs, this always
+  returns 'ok', i.e. if the server is not up the connection will fail or we
+  would get no response at all.
+
+  Args:
+    server: VirtualMachine Aerospike has been installed on.
+
+  Raises:
+    errors.Resource.RetryableCreationError when response is not 'ok' or if there
+      is an error connecting to the telnet port or otherwise running the remote
+      check command.
+  """
+  address = server.internal_ip
+  port = AEROSPIKE_DEFAULT_TELNET_PORT
+
+  logging.info("Trying to connect to Aerospike at %s:%s" % (address, port))
+  try:
+    def _NetcatPrefix():
+      _, stderr = server.RemoteCommand('nc -h', ignore_failure=True)
+      if '-q' in stderr:
+        return 'nc -q 1'
+      else:
+        return 'nc -i 1'
+
+    out, _ = server.RemoteCommand(
+        '(echo -e "status\n" ; sleep 1)| %s %s %s' % (
+            _NetcatPrefix(), address, port))
+    if out.startswith('ok'):
+      logging.info("Aerospike server status is OK. Server up and running.")
+      return
+  except errors.VirtualMachine.RemoteCommandError as e:
+    raise errors.Resource.RetryableCreationError(
+        "Aerospike server not up yet: %s." % str(e))
+  else:
+    raise errors.Resource.RetryableCreationError(
+        "Aerospike server not up yet. Expected 'ok' but got '%s'." % out)
+
+
 def ConfigureAndStart(server, seed_node_ips=None):
   """Prepare the Aerospike server on a VM.
 
@@ -68,23 +123,30 @@ def ConfigureAndStart(server, seed_node_ips=None):
   seed_node_ips = seed_node_ips or [server.internal_ip]
 
   if FLAGS.aerospike_storage_type == DISK:
-    if FLAGS.data_disk_type == disk.LOCAL:
-      devices = server.GetLocalDisks()
-    else:
-      devices = [scratch_disk.GetDevicePath()
-                 for scratch_disk in server.scratch_disks]
+    devices = [scratch_disk.GetDevicePath()
+               for scratch_disk in server.scratch_disks]
   else:
     devices = []
 
-  server.RenderTemplate(data.ResourcePath('aerospike.conf.j2'),
-                        AEROSPIKE_CONF_PATH,
-                        {'devices': devices,
-                         'seed_addresses': seed_node_ips})
+  server.RenderTemplate(
+      data.ResourcePath('aerospike.conf.j2'), AEROSPIKE_CONF_PATH,
+      {'devices': devices,
+       'memory_size': int(server.total_memory_kb * 0.8),
+       'seed_addresses': seed_node_ips,
+       'transaction_threads_per_queue':
+       FLAGS.aerospike_transaction_threads_per_queue,
+       'replication_factor': FLAGS.aerospike_replication_factor})
 
   for scratch_disk in server.scratch_disks:
-    server.RemoteCommand('sudo umount %s' % scratch_disk.mount_point)
+    if scratch_disk.mount_point:
+      server.RemoteCommand('sudo umount %s' % scratch_disk.mount_point)
 
   server.RemoteCommand('cd %s && make init' % AEROSPIKE_DIR)
   server.RemoteCommand('cd %s; nohup sudo make start &> /dev/null &' %
                        AEROSPIKE_DIR)
-  time.sleep(5)  # Wait for server to come up
+  _WaitForServerUp(server)
+  logging.info("Aerospike server configured and started.")
+
+
+def Uninstall(vm):
+  vm.RemoteCommand('rm -rf %s' % AEROSPIKE_DIR)

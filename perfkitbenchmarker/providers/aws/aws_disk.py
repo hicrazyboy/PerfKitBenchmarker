@@ -39,6 +39,8 @@ VOLUME_KNOWN_STATUSES = VOLUME_EXISTS_STATUSES | VOLUME_DELETED_STATUSES
 STANDARD = 'standard'
 GP2 = 'gp2'
 IO1 = 'io1'
+ST1 = 'st1'
+SC1 = 'sc1'
 
 DISK_TYPE = {
     disk.STANDARD: STANDARD,
@@ -50,39 +52,54 @@ DISK_METADATA = {
     STANDARD: {
         disk.MEDIA: disk.HDD,
         disk.REPLICATION: disk.ZONE,
-        disk.LEGACY_DISK_TYPE: disk.STANDARD
     },
     GP2: {
         disk.MEDIA: disk.SSD,
         disk.REPLICATION: disk.ZONE,
-        disk.LEGACY_DISK_TYPE: disk.REMOTE_SSD
     },
     IO1: {
         disk.MEDIA: disk.SSD,
         disk.REPLICATION: disk.ZONE,
-        disk.LEGACY_DISK_TYPE: disk.PIOPS
+    },
+    ST1: {
+        disk.MEDIA: disk.HDD,
+        disk.REPLICATION: disk.ZONE
+    },
+    SC1: {
+        disk.MEDIA: disk.HDD,
+        disk.REPLICATION: disk.ZONE
     }
 }
 
 LOCAL_SSD_METADATA = {
     disk.MEDIA: disk.SSD,
     disk.REPLICATION: disk.NONE,
-    disk.LEGACY_DISK_TYPE: disk.LOCAL
 }
 
 LOCAL_HDD_METADATA = {
     disk.MEDIA: disk.HDD,
     disk.REPLICATION: disk.NONE,
-    disk.LEGACY_DISK_TYPE: disk.LOCAL
 }
 
 LOCAL_HDD_PREFIXES = ['d2', 'hs']
+EBS_NVME_TYPES = ['c5', 'm5']
+LOCAL_NVME_TYPES = ['i3', 'f1']
 
 
 def LocalDiskIsHDD(machine_type):
   """Check whether the local disks use spinning magnetic storage."""
 
   return machine_type[:2].lower() in LOCAL_HDD_PREFIXES
+
+
+def LocalDriveIsNvme(machine_type):
+  """Check if the machine type uses NVMe driver."""
+  return machine_type[:2].lower() in LOCAL_NVME_TYPES
+
+
+def EbsDriveIsNvme(machine_type):
+  """Check if the machine type uses NVMe driver."""
+  return machine_type[:2].lower() in EBS_NVME_TYPES
 
 
 AWS = 'AWS'
@@ -143,13 +160,15 @@ class AwsDisk(disk.BaseDisk):
     self.region = util.GetRegionFromZone(zone)
     self.device_letter = None
     self.attached_vm_id = None
-
+    self.machine_type = machine_type
     if self.disk_type != disk.LOCAL:
-      self.metadata = DISK_METADATA[self.disk_type]
+      self.metadata.update(DISK_METADATA.get(self.disk_type, {}))
     else:
-      self.metadata = (LOCAL_HDD_METADATA
-                       if LocalDiskIsHDD(machine_type)
-                       else LOCAL_SSD_METADATA)
+      self.metadata.update((LOCAL_HDD_METADATA
+                            if LocalDiskIsHDD(machine_type)
+                            else LOCAL_SSD_METADATA))
+    if self.iops:
+      self.metadata['iops'] = self.iops
 
   def _Create(self):
     """Creates the disk."""
@@ -210,13 +229,14 @@ class AwsDisk(disk.BaseDisk):
       self.device_letter = min(AwsDisk.vm_devices[self.attached_vm_id])
       AwsDisk.vm_devices[self.attached_vm_id].remove(self.device_letter)
 
+    device_name = '/dev/xvdb%s' % self.device_letter
     attach_cmd = util.AWS_PREFIX + [
         'ec2',
         'attach-volume',
         '--region=%s' % self.region,
         '--instance-id=%s' % self.attached_vm_id,
         '--volume-id=%s' % self.id,
-        '--device=%s' % self.GetDevicePath()]
+        '--device=%s' % device_name]
     logging.info('Attaching AWS volume %s. This may fail if the disk is not '
                  'ready, but will be retried.', self.id)
     util.IssueRetryableCommand(attach_cmd)
@@ -240,6 +260,11 @@ class AwsDisk(disk.BaseDisk):
   def GetDevicePath(self):
     """Returns the path to the device inside the VM."""
     if self.disk_type == disk.LOCAL:
+      if LocalDriveIsNvme(self.machine_type):
+        return '/dev/nvme%sn1' % str(ord(self.device_letter) - ord('b'))
       return '/dev/xvd%s' % self.device_letter
     else:
-      return '/dev/xvdb%s' % self.device_letter
+      if EbsDriveIsNvme(self.machine_type):
+        return '/dev/nvme%sn1' % (1 + ord(self.device_letter) - ord('a'))
+      else:
+        return '/dev/xvdb%s' % self.device_letter

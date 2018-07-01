@@ -14,10 +14,10 @@
 
 """An interface to Google Cloud Storage, using the boto library."""
 
-import logging
 import time
 
-import gflags as flags
+from absl import flags
+import gcs_oauth2_boto_plugin  # noqa
 
 import boto_service
 
@@ -26,9 +26,6 @@ FLAGS = flags.FLAGS
 
 class GCSService(boto_service.BotoService):
   def __init__(self):
-    # GCS does not use separate endpoints, so host_to_connect makes no sense.
-    if FLAGS.host is not None:
-      logging.warning('GCSService ignoring --host=%s', FLAGS.host)
     super(GCSService, self).__init__('gs', host_to_connect=None)
 
   def WriteObjectFromBuffer(self, bucket, object, stream, size):

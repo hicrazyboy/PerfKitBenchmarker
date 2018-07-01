@@ -60,21 +60,19 @@ CREATE_TABLE_SCRIPT = 'cassandra/create-ycsb-table.cql.j2'
 
 def GetConfig(user_config):
   config = configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
-  num_vms = max(FLAGS.num_vms, 3)
-  config['vm_groups']['workers']['vm_count'] = num_vms
+  config['vm_groups']['workers']['vm_count'] = FLAGS.num_vms if FLAGS[
+      'num_vms'].present else 3
   if FLAGS['ycsb_client_vms'].present:
     config['vm_groups']['clients']['vm_count'] = FLAGS.ycsb_client_vms
   return config
 
 
-def CheckPrerequisites():
+def CheckPrerequisites(benchmark_config):
   """Verifies that the required resources are present.
 
   Raises:
     perfkitbenchmarker.data.ResourceNotFound: On missing resource.
   """
-  if FLAGS['num_vms'].present and FLAGS.num_vms < 3:
-    raise ValueError('cassandra_ycsb requires at least 3 Cassandra VMs.')
   cassandra.CheckPrerequisites()
   ycsb.CheckPrerequisites()
   data.ResourcePath(CREATE_TABLE_SCRIPT)
@@ -107,7 +105,10 @@ def _CreateYCSBTable(vm, keyspace=KEYSPACE_NAME, column_family=COLUMN_FAMILY,
 def _GetVMsByRole(benchmark_spec):
   """Gets a dictionary mapping role to a list of VMs."""
   cassandra_vms = benchmark_spec.vm_groups['workers']
-  clients = benchmark_spec.vm_groups['clients']
+  if FLAGS.ycsb_client_vms:
+    clients = benchmark_spec.vm_groups['clients']
+  else:
+    clients = cassandra_vms
   return {'vms': benchmark_spec.vms,
           'cassandra_vms': cassandra_vms,
           'seed_vm': cassandra_vms[0],
@@ -139,12 +140,22 @@ def Prepare(benchmark_spec):
                            for vm in cassandra_vms]
   ycsb_install_fns = [functools.partial(vm.Install, 'ycsb')
                       for vm in loaders]
-
-  vm_util.RunThreaded(lambda f: f(), cassandra_install_fns + ycsb_install_fns)
+  if FLAGS.ycsb_client_vms:
+    vm_util.RunThreaded(lambda f: f(), cassandra_install_fns + ycsb_install_fns)
+  else:
+    # If putting server and client on same vm, prepare packages one by one to
+    # avoid race condition.
+    vm_util.RunThreaded(lambda f: f(), cassandra_install_fns)
+    vm_util.RunThreaded(lambda f: f(), ycsb_install_fns)
 
   cassandra.StartCluster(seed_vm, by_role['non_seed_cassandra_vms'])
 
-  _CreateYCSBTable(seed_vm)
+  _CreateYCSBTable(
+      seed_vm, replication_factor=FLAGS.cassandra_replication_factor)
+
+  benchmark_spec.executor = ycsb.YCSBExecutor(
+      'cassandra-10',
+      hosts=','.join(vm.internal_ip for vm in cassandra_vms))
 
 
 def Run(benchmark_spec):
@@ -161,9 +172,6 @@ def Run(benchmark_spec):
   cassandra_vms = _GetVMsByRole(benchmark_spec)['cassandra_vms']
   logging.debug('Loaders: %s', loaders)
 
-  executor = ycsb.YCSBExecutor(
-      'cassandra-10',
-      hosts=','.join(vm.internal_ip for vm in cassandra_vms))
 
   kwargs = {'hosts': ','.join(vm.internal_ip for vm in cassandra_vms),
             'columnfamily': COLUMN_FAMILY,
@@ -173,11 +181,14 @@ def Run(benchmark_spec):
             'cassandra.deleteconsistencylevel': WRITE_CONSISTENCY}
 
   metadata = {'ycsb_client_vms': FLAGS.ycsb_client_vms,
-              'num_vms': len(cassandra_vms)}
+              'num_vms': len(cassandra_vms),
+              'concurrent_reads': FLAGS.cassandra_concurrent_reads,
+              'replication_factor': FLAGS.cassandra_replication_factor}
+  if not FLAGS.ycsb_client_vms:
+    metadata['ycsb_client_on_server'] = True
 
-  samples = list(executor.LoadAndRun(loaders,
-                                     load_kwargs=kwargs,
-                                     run_kwargs=kwargs))
+  samples = list(benchmark_spec.executor.LoadAndRun(
+      loaders, load_kwargs=kwargs, run_kwargs=kwargs))
 
   for sample in samples:
     sample.metadata.update(metadata)

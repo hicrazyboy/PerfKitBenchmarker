@@ -2,19 +2,19 @@ PerfKit Benchmarker
 ==================
 
 PerfKit Benchmarker is an open effort to define a canonical set of benchmarks to measure and compare cloud
-offerings.  It's designed to operate via vendor provided command line tools. The benchmarks are not
-tuned (ie the defaults) because this is what most users will use.  This should help us drive to great defaults.
+offerings.  It's designed to operate via vendor provided command line tools. The benchmark default settings are not
+tuned for any particular platform or instance type. These settings are recommended for consistency across services.
 Only in the rare case where there is a common practice like setting the buffer pool size of a database do we
 change any settings.
 
-This README is designed to give you the information you need to get running with the benchmarker and the basics of working with the code.  The [wiki] (https://github.com/GoogleCloudPlatform/PerfKitBenchmarker/wiki) contains more detailed information:
+This README is designed to give you the information you need to get running with the benchmarker and the basics of working with the code.  The [wiki](https://github.com/GoogleCloudPlatform/PerfKitBenchmarker/wiki) contains more detailed information:
 
-* [FAQ] (https://github.com/GoogleCloudPlatform/PerfKitBenchmarker/wiki/FAQ)
-* [Tech Talks] (https://github.com/GoogleCloudPlatform/PerfKitBenchmarker/wiki/Tech-Talks)
-* [Governing rules] (https://github.com/GoogleCloudPlatform/PerfKitBenchmarker/wiki/Governing-Rules)
-* [Community meeting decks and notes] (https://github.com/GoogleCloudPlatform/PerfKitBenchmarker/wiki/Community-Meeting-Notes-Decks)
-* [Design documents] (https://github.com/GoogleCloudPlatform/PerfKitBenchmarker/wiki/Design-Docs)
-* You are always welcome to [open an issue] (https://github.com/GoogleCloudPlatform/PerfKitBenchmarker/issues) as well to contact us.
+* [FAQ](https://github.com/GoogleCloudPlatform/PerfKitBenchmarker/wiki/FAQ)
+* [Tech Talks](https://github.com/GoogleCloudPlatform/PerfKitBenchmarker/wiki/Tech-Talks)
+* [Governing rules](https://github.com/GoogleCloudPlatform/PerfKitBenchmarker/wiki/Governing-Rules)
+* [Community meeting decks and notes](https://github.com/GoogleCloudPlatform/PerfKitBenchmarker/wiki/Community-Meeting-Notes-Decks)
+* [Design documents](https://github.com/GoogleCloudPlatform/PerfKitBenchmarker/wiki/Design-Docs)
+* You are always welcome to [open an issue](https://github.com/GoogleCloudPlatform/PerfKitBenchmarker/issues), or to join us on #PerfKitBenchmarker on freenode to discuss issues you're having, pull requests, or anything else related to PerfKitBenchmarker
 
 
 Known Issues
@@ -39,13 +39,18 @@ In its current release these are the benchmarks that are executed:
   - `bonnie++`: [GPL v2](http://www.coker.com.au/bonnie++/readme.html)
   - `cassandra_ycsb`: [Apache v2](http://cassandra.apache.org/)
   - `cassandra_stress`: [Apache v2](http://cassandra.apache.org/)
-  - `cloudsuite3.0`: [CloudSuite 3.0 license](http://cloudsuite.ch/licenses/)
+  - `cloudsuite3.0`: [CloudSuite 3.0 license](http://cloudsuite.ch/pages/license/)
   - `cluster_boot`: MIT License
   - `coremark`: [EEMBC](https://www.eembc.org/)
   - `copy_throughput`: Apache v2
   - `fio`: [GPL v2](https://github.com/axboe/fio/blob/master/COPYING)
+  - [`gpu_pcie_bandwidth`](https://developer.nvidia.com/cuda-downloads): [NVIDIA
+    Software Licence
+    Agreement](http://docs.nvidia.com/cuda/eula/index.html#nvidia-driver-license)
   - `hadoop_terasort`: [Apache v2](http://hadoop.apache.org/)
   - `hpcc`: [Original BSD license](http://icl.cs.utk.edu/hpcc/faq/#263)
+  - [`hpcg`](https://github.com/hpcg-benchmark/hpcg/): [BSD
+    3-clause](https://github.com/hpcg-benchmark/hpcg/blob/master/LICENSE)
   - `iperf`: [BSD license](http://iperf.sourceforge.net/)
   - `memtier_benchmark`: [GPL v2](https://github.com/RedisLabs/memtier_benchmark)
   - `mesh_network`: [HP license](http://www.calculate-linux.org/packages/licenses/netperf)
@@ -57,11 +62,16 @@ In its current release these are the benchmarks that are executed:
   - [`oldisim`](https://github.com/GoogleCloudPlatform/oldisim):
     [Apache v2](https://github.com/GoogleCloudPlatform/oldisim/blob/master/LICENSE.txt)
   - `object_storage_service`: Apache v2
+  - `pgbench`: [PostgreSQL Licence](https://www.postgresql.org/about/licence/)
   - `ping`: No license needed.
   - `silo`: MIT License
   - `scimark2`: [public domain](http://math.nist.gov/scimark2/credits.html)
   - `speccpu2006`: [SPEC CPU2006](http://www.spec.org/cpu2006/)
+  - [`SHOC`](https://github.com/vetter/shoc): [BSD
+    3-clause](https://github.com/vetter/shoc/blob/master/LICENSE.txt)
   - `sysbench_oltp`: [GPL v2](https://github.com/akopytov/sysbench)
+  - [`TensorFlow`](https://github.com/tensorflow/tensorflow): [Apache
+    v2](https://github.com/tensorflow/tensorflow/blob/master/LICENSE)
   - [`tomcat`](https://github.com/apache/tomcat):
     [Apache v2](https://github.com/apache/tomcat/blob/trunk/LICENSE)
   - [`unixbench`](https://github.com/kdlucas/byte-unixbench):
@@ -108,9 +118,10 @@ Before you can run the PerfKit Benchmarker, you need account(s) on the cloud pro
 * [Google Cloud Platform](https://cloud.google.com)
 * [AWS](http://aws.amazon.com)
 * [Azure](http://azure.microsoft.com)
-* [AliCloud](http://www.alicloud.com)
+* [AliCloud](http://www.aliyun.com)
 * [DigitalOcean](https://www.digitalocean.com)
 * [Rackspace Cloud](https://www.rackspace.com)
+* [ProfitBricks](https://www.profitbricks.com/)
 
 You also need the software dependencies, which are mostly command line tools and credentials to access your
 accounts without a password.  The following steps should help you get the CLI tool auth in place.
@@ -151,19 +162,31 @@ $ cd /path/to/PerfKitBenchmarker
 $ sudo pip install -r requirements.txt
 ```
 
+## Preprovisioned data
+
+Some benchmarks may require data to be preprovisioned in a cloud. To
+preprovision data, you will need to obtain the data and then upload it to that
+cloud. See more information below about which benchmarks require preprovisioned
+data and how to upload it to different clouds.
+
+Note. Before we start to switch over to preprovisioned data, we should support
+a fallback strategy of downloading files to the data/ directory on the machine
+used to run PerfKitBenchmarker (as is done today for CoreMark and SPEC CPU2006).
+
 ## Cloud account setup
 
-This section describes the setup steps needed for each cloud system.  
+This section describes the setup steps needed for each cloud system. Note that you only need to perform setup steps on the clouds you wish to test. If you only want to test Google Cloud, you only need to install and configure `gcloud`.
 * [Google Cloud](#install-gcloud-and-setup-authentication)
-* [OpenStack](#install-openstack-nova-client-and-setup-authentication)
+* [OpenStack](#install-openstack-cli-client-and-setup-authentication)
 * [Kubernetes](#kubernetes-configuration-and-credentials)
 * [Mesos](#mesos-configuration)
-* [Cloudstack](#cloudstack-install-csapi-and-set-the-api-keys)
+* [Cloudstack](#cloudstack-install-dependencies-and-set-the-api-keys)
 * [AWS](#install-aws-cli-and-setup-authentication)
 * [Azure](#windows-azure-cli-and-credentials)
 * [AliCloud](#install-alicloud-cli-and-setup-authentication)
 * [DigitalOcean](#digitalocean-configuration-and-credentials)
 * [RackSpace](#installing-clis-and-credentials-for-rackspace)
+* [ProfitBricks](#profitbricks-configuration-and-credentials)
 
 After configuring the clouds you intend to use, skip to [Running a Single Benchmark](#running-a-single-benchmark), unless you are going to use an object storage benchmark, in which case you need to [configure a boto file](#create-and-configure-a-boto-file-for-object-storage-benchmarks).
 
@@ -196,41 +219,17 @@ $ gcloud auth login
 
 For help, see [`gcloud` docs](https://cloud.google.com/sdk/gcloud/).
 
-### Install OpenStack Nova client and setup authentication
+### Install OpenStack CLI client and setup authentication
 Make sure you have installed pip (see the section above).
 
-Install `python-novaclient` via the following command:
+Install OpenStack CLI utilities via the following command:
 
 ```bash
 $ sudo pip install -r perfkitbenchmarker/providers/openstack/requirements.txt
 ```
 
-You must specify authentication information for test execution, including user
-name (``--openstack_username` flag or `OS_USERNAME` environment variable), tenant name
-(`--openstack_tenant` flag or `OS_TENANT_NAME` environment variable), and
-authentication URL (`--openstack_auth_url` flag or `OS_AUTH_URL` environment
-variable).
-
-The password cannot be set through a flag. You can specify it through the
-`OS_PASSWORD` environment variable, or alternatively you can save it in a file
-and specify the file location with the `--openstack_password_file` flag or
-`OPENSTACK_PASSWORD_FILE` environment variable.
-
-Example using environment variables:
-
-```bash
-export OS_USERNAME=admin
-export OS_TENANT=myproject
-export OS_AUTH_URL=http://localhost:5000
-export OS_PASSWORD=<password>
-```
-
-Example using a password file at the default file location:
-
-```bash
-$ echo topsecretpassword > ~/.config/openstack-password.txt
-$ ./pkb.py --cloud=OpenStack --benchmarks=ping
-```
+To setup credentials and endpoint information simply set the environment
+variables using an OpenStack RC file. For help, see [`OpenStack` docs](http://docs.openstack.org/cli-reference/common/cli_set_environment_variables_using_openstack_rc.html)
 
 ### Kubernetes configuration and credentials
 Perfkit uses the `kubectl` binary in order to communicate with a Kubernetes cluster - you need to pass the path to the `kubectl` binary using the `--kubectl` flag. It's recommended to use [version 1.0.1](https://storage.googleapis.com/kubernetes-release/release/v1.0.1/bin/linux/amd64/kubectl).
@@ -385,30 +384,32 @@ $ aws configure
 ```
 
 ### Windows Azure CLI and credentials
-You first need to install node.js and NPM.
-This version of Perfkit Benchmarker is compatible with azure version 0.9.9.
+
+You first need to install node.js and NPM.  This version of Perfkit Benchmarker
+is known to be compatible with Azure CLI version 0.10.4, and will likely work
+with any version newer than that.
 
 Go [here](https://nodejs.org/download/), and follow the setup instructions.
 
 Next, run the following (omit the `sudo` on Windows):
 
 ```bash
-$ sudo npm install azure-cli@0.9.9 -g
-$ azure account download
+$ sudo npm install azure-cli -g
+$ azure login
 ```
-
-Read the output of the previous command. It will contain a webpage URL. Open that in a browser. It will download
-a file (`.publishsettings`) file. Copy to the folder you're running PerfKit Benchmarker. In my case the file was called
-`Free Trial-7-18-2014-credentials.publishsettings`.
-
-```bash
-$ azure account import [path to .publishsettings file]
-```
-
 Test that `azure` is installed correctly:
 
 ```bash
 $ azure vm list
+```
+
+Finally, make sure Azure is in Resource Management mode and that your account is
+authorized to allocate VMs and networks from Azure:
+
+```bash
+$ azure config mode arm
+$ azure provider register Microsoft.Compute
+$ azure provider register Microsoft.Network
 ```
 
 ### Install AliCloud CLI and setup authentication
@@ -434,6 +435,13 @@ Run the following command to install `aliyuncli` (omit the `sudo` on Windows)
 
    ```bash
    $ sudo pip install -r perfkitbenchmarker/providers/alicloud/requirements.txt
+   ```
+   In some CentOS version, you may need:
+   
+   ```bash
+   $ sudo yum install libffi-devel.x86_64
+   $ sudo yum install openssl-devel.x86_64
+   $ sudo pip install 'colorama<=0.3.3'
    ```
 
    To check if AliCloud is installed:
@@ -485,37 +493,12 @@ Run the following command to install `aliyuncli` (omit the `sudo` on Windows)
 
 ### DigitalOcean configuration and credentials
 
-PerfKit Benchmarker uses the `curl` tool to interact with
-DigitalOcean's REST API. This API uses oauth for authentication.
-Please set this up as follows:
+1. Install `doctl`, the DigitalOcean CLI, following the instructions at
+`https://github.com/digitalocean/doctl`.
 
-Log in to your DigitalOcean account and create a Personal Access Token
-for use by PerfKit Benchmarker with read/write access in [Settings /
-API](https://cloud.digitalocean.com/settings/applications).
-
-Save a copy of the authentication token it shows, this is a
-64-character hex string.
-
-Create a curl configuration file containing the needed authorization
-header. The double quotes are required. Example:
-
-```bash
-$ cat > ~/.config/digitalocean-oauth.curl
-header = "Authorization: Bearer 9876543210fedc...ba98765432"
-^D
-```
-
-Confirm that the authentication works:
-
-```bash
-$ curl --config ~/.config/digitalocean-oauth.curl https://api.digitalocean.com/v2/sizes
-{"sizes":[{"slug":"512mb","memory":512,"vcpus":1,...
-```
-
-PerfKit Benchmarker uses the file location `~/.config/digitalocean-oauth.curl`
-by default, you can use the `--digitalocean_curl_config` flag to
-override the path.
-
+2. Authenticate with `doctl`. The easiest way is running `doctl auth login` and
+   following the instructions, but any of the options at the `doctl` site will
+   work.
 
 ### Installing CLIs and credentials for Rackspace
 
@@ -534,6 +517,35 @@ You can find more details here: https://developer.rackspace.com/docs/rack-cli/co
 
 **Note:** Not all flavors are supported on every region. Always check first
 if the flavor is supported in the region.
+
+
+### ProfitBricks configuration and credentials
+
+Get started by running:
+```bash
+$ sudo pip install -r perfkitbenchmarker/providers/profitbricks/requirements.txt
+```
+
+PerfKit Benchmarker uses the 
+<a href='http://docs.python-requests.org/en/master/'>Requests</a> module 
+to interact with ProfitBricks' REST API. HTTP Basic authentication is used 
+to authorize access to the API. Please set this up as follows:
+
+Create a configuration file containing the email address and password 
+associated with your ProfitBricks account, separated by a colon. 
+Example:
+
+```bash
+$ less ~/.config/profitbricks-auth.cfg
+email:password
+```
+
+The PerfKit Benchmarker will automatically base64 encode your credentials 
+before making any calls to the REST API.
+
+PerfKit Benchmarker uses the file location `~/.config/profitbricks-auth.cfg`
+by default. You can use the `--profitbricks_config` flag to
+override the path.
 
 
 ## Image prerequisites for Docker based clouds
@@ -560,7 +572,10 @@ Open the `.boto` file and edit the following fields:
 
 1. In the [Credentials] section:
 
-   `gs_oauth2_refresh_token`: set it to be the same as the `refresh_token` field in your gcloud credential file (~/.config/gcloud/credentials), which was setup as part of the `gcloud auth login` step.
+   `gs_oauth2_refresh_token`: set it to be the same as the `refresh_token` field in your gcloud credential file (~/.config/gcloud/credentials.db), which was setup as part of the `gcloud auth login` step. To see the refresh token, run
+   ```bash
+   $ strings ~/.config/gcloud/credentials.db.
+   ```
 
    `aws_access_key_id`, `aws_secret_access_key`: set these to be the AWS access keys you intend to use for these tests, or you can use the same keys as those in your existing AWS credentials file (`~/.aws/credentials`).
 
@@ -570,7 +585,7 @@ Open the `.boto` file and edit the following fields:
 
 3. In the `[OAuth2]` section:
 
-   `client_id`, `client_secret`: set these to be the same as those in your gcloud credentials file (`~/.config/gcloud/credentials`), which was setup as part of the `gcloud auth login` step.
+   `client_id`, `client_secret`: set these to be the same as those in your gcloud credentials file (`~/.config/gcloud/credentials.db`), which was setup as part of the `gcloud auth login` step.
 
 
 Running a Single Benchmark
@@ -588,13 +603,13 @@ $ ./pkb.py --project=<GCP project ID> --benchmarks=iperf --machine_type=f1-micro
 
 ```bash
 $ cd PerfKitBenchmarker
-$ ./pkb.py --cloud=AWS --benchmarks=iperf --machine_type=t1.micro
+$ ./pkb.py --cloud=AWS --benchmarks=iperf --machine_type=t2.micro
 ```
 
 ## Example run on Azure
 
 ```bash
-$ ./pkb.py --cloud=Azure --machine_type=ExtraSmall --benchmarks=iperf
+$ ./pkb.py --cloud=Azure --machine_type=Standard_A0 --benchmarks=iperf
 ```
 
 ## Example run on AliCloud
@@ -612,13 +627,14 @@ $ ./pkb.py --cloud=DigitalOcean --machine_type=16gb --benchmarks=iperf
 ## Example run on OpenStack
 
 ```bash
-$ ./pkb.py --cloud=OpenStack --benchmarks=iperf --os_auth_url=http://localhost:5000/v2.0/
+$ ./pkb.py --cloud=OpenStack --machine_type=m1.medium \
+           --openstack_network=private --benchmarks=iperf
 ```
 
 ## Example run on Kubernetes
 
 ```bash
-$ ./pkb.py --cloud=Kubernetes --benchmarks=iperf --kubectl=/path/to/kubectl --kubeconfig=/path/to/kubeconfig --image=image-with-ssh-server  --ceph_monitors=10.20.30.40:6789,10.20.30.41:6789 --kubernetes_nodes=10.20.30.42,10.20.30.43
+$ ./pkb.py --cloud=Kubernetes --benchmarks=iperf --kubectl=/path/to/kubectl --kubeconfig=/path/to/kubeconfig --image=image-with-ssh-server  --ceph_monitors=10.20.30.40:6789,10.20.30.41:6789
 ```
 
 ## Example run on Mesos
@@ -639,16 +655,19 @@ $ ./pkb.py --cloud=Mesos --benchmarks=iperf --marathon_address=localhost:8080 --
 $ ./pkb.py --cloud=Rackspace --machine_type=general1-2 --benchmarks=iperf
 ```
 
+## Example run on ProfitBricks
+
+```bash
+$ ./pkb.py --cloud=ProfitBricks --machine_type=Small --benchmarks=iperf
+```
+
 How to Run Windows Benchmarks
 ==================
-You must be running on a Windows machine in order to run Windows benchmarks.
-Install all dependencies as above and set TrustedHosts to accept all hosts so
-that you can open PowerShell sessions with the VMs (both machines having each
-other in their TrustedHosts list is necessary, but not sufficient to issue
-remote commands; valid credentials are still required):
-
-```
-set-item wsman:\localhost\Client\TrustedHosts -value *
+Install all dependencies as above and ensure that smbclient is installed on
+your system if you are running on a linux controller:
+```bash
+$ which smbclient
+/usr/bin/smbclient
 ```
 
 Now you can run Windows benchmarks by running with `--os_type=windows`. Windows has a
@@ -696,15 +715,16 @@ PerfKit Benchmarker.
 
 Flag | Notes
 -----|------
-`--help`         | see all flags
+`--helpmatch=pkb`         | see all global flags
+`--helpmatch=hpcc` | see all flags associated with the hpcc benchmark. You can substitute any benchmark name to see the associated flags.
 `--benchmarks`   | A comma separated list of benchmarks or benchmark sets to run such as `--benchmarks=iperf,ping` . To see the full list, run `./pkb.py --help`
 `--cloud`        | Cloud where the benchmarks are run. See the table below for choices.
 `--machine_type` | Type of machine to provision if pre-provisioned machines are not used. Most cloud providers accept the names of pre-defined provider-specific machine types (for example, GCP supports `--machine_type=n1-standard-8` for a GCE n1-standard-8 VM). Some cloud providers support YAML expressions that match the corresponding VM spec machine_type property in the [YAML configs](#configurations-and-configuration-overrides) (for example, GCP supports `--machine_type="{cpus: 1, memory: 4.5GiB}"` for a GCE custom VM with 1 vCPU and 4.5GiB memory). Note that the value provided by this flag will affect all provisioned machines; users who wish to provision different machine types for different roles within a single benchmark run should use the [YAML configs](#configurations-and-configuration-overrides) for finer control.
-`--zone`         | This flag allows you to override the default zone. See the table below.
+`--zones`         | This flag allows you to override the default zone. See the table below.
 `--data_disk_type` | Type of disk to use. Names are provider-specific, but see table below.
 
 The default cloud is 'GCP', override with the `--cloud` flag. Each cloud has a default
-zone which you can override with the `--zone` flag, the flag supports the same values
+zone which you can override with the `--zones` flag, the flag supports the same values
 that the corresponding Cloud CLIs take:
 
 Cloud name | Default zone | Notes
@@ -718,11 +738,12 @@ OpenStack | nova | |
 CloudStack | QC-1 | |
 Rackspace | IAD | OnMetal machine-types are available only in IAD zone
 Kubernetes | k8s | |
+ProfitBricks | AUTO | Additional zones: ZONE_1, ZONE_2, or ZONE_3
 
 Example:
 
 ```bash
-./pkb.py --cloud=GCP --zone=us-central1-a --benchmarks=iperf,ping
+./pkb.py --cloud=GCP --zones=us-central1-a --benchmarks=iperf,ping
 ```
 
 The disk type names vary by provider, but the following table summarizes some
@@ -732,7 +753,7 @@ Cloud name | Network-attached SSD | Network-attached HDD
 -----------|----------------------|---------------------
 GCP | pd-ssd | pd-standard
 AWS | gp2 | standard
-Azure | premium-storage | standard-disk
+Azure | Premium_LRS | Standard_LRS
 Rackspace | cbs-ssd | cbs-sata
 
 Also note that `--data_disk_type=local` tells PKB not to allocate a separate
@@ -758,6 +779,49 @@ Flag | Notes
 `--http_proxy`       | Needed for package manager on Guest OS and for some Perfkit packages
 `--https_proxy`      | Needed for package manager or Ubuntu guest and for from github downloaded packages
 `--ftp_proxy`       | Needed for some Perfkit packages
+
+
+## Preprovisioned Data
+
+As mentioned above, some benchmarks require preprovisioned data. This section
+describes how to preprovision this data.
+
+### Benchmarks with Preprovisioned Data
+
+#### Sample Preprovision Benchmark
+
+This benchmark demonstrates the use of preprovisioned data. Create the following
+file to upload using the command line:
+```bash
+echo "1234567890" > preprovisioned_data.txt
+```
+To upload, follow the instructions below with a filename of
+`preprovisioned_data.txt` and a benchmark name of `sample`.
+
+### Clouds with Preprovisioned Data
+
+#### Google Cloud
+
+To preprovision data on Google Cloud, you will need to upload each file to
+Google Cloud Storage using gsutil. First, you will need to create a storage
+bucket that is accessible from VMs created in Google Cloud by PKB. Then copy
+each file to this bucket using the command
+```bash
+gsutil cp <filename> gs://<bucket>/<benchmark-name>/<filename>
+```
+To run a benchmark on Google Cloud that uses the preprovisioned data, use the
+flag `--gcp_preprovisioned_data_bucket=<bucket>`.
+
+#### AWS
+
+To preprovision data on AWS, you will need to upload each file to S3 using the
+AWS CLI. First, you will need to create a storage bucket that is accessible from
+VMs created in AWS by PKB. Then copy each file to this bucket using the command
+```bash
+aws s3 cp <filename> s3://<bucket>/<benchmark-name>/<filename>
+```
+To run a benchmark on AWS that uses the preprovisioned data, use the flag
+`--aws_preprovisioned_data_bucket=<bucket>`.
 
 Configurations and Configuration Overrides
 ==================
@@ -897,7 +961,7 @@ iperf:
 I called my file `iperf.yaml` and used it to run iperf from Siberia to a GCP VM in us-central1-f as follows:
 
 ```bash
-$ ./pkb.py --benchmarks=iperf --machine_type=f1-micro --benchmark_config_file=iperf.yaml --zone=us-central1-f --ip_addresses=EXTERNAL
+$ ./pkb.py --benchmarks=iperf --machine_type=f1-micro --benchmark_config_file=iperf.yaml --zones=us-central1-f --ip_addresses=EXTERNAL
 ```
 
 * `ip_addresses=EXTERNAL` tells PerfKit Benchmarker not to use 10.X (ie Internal) machine addresses that all Cloud VMs have.  Just use the external IP address.
@@ -951,6 +1015,42 @@ netperf:
 
 The new defaults will only apply to the benchmark in which they are specified.
 
+Using Elasticsearch Publisher
+=================
+PerfKit data can optionally be published to an Elasticsearch server. To enable this, the
+`elasticsearch` Python package must be installed.
+
+```bash
+$ sudo pip install elasticsearch
+```
+
+Note: The `elasticsearch` Python library and Elasticsearch must have matching major versions.
+
+The following are flags used by the Elasticsearch publisher. At minimum, all that is needed
+is the `--es_uri` flag.
+
+Flag | Notes
+-----|------
+`--es_uri`         | The Elasticsearch server address and port (e.g. localhost:9200)
+`--es_index`       | The Elasticsearch index name to store documents (default: perfkit)
+`--es_type`        | The Elasticsearch document type (default: result)
+
+Note: Amazon ElasticSearch service currently does not support transport on port 9200 therefore you must use endpoint with port 80 eg. `search-<ID>.es.amazonaws.com:80` and allow your IP address in the cluster.
+
+Using InfluxDB Publisher
+=================
+No additional packages need to be installed in order to publish Perfkit data to an InfluxDB
+server.
+
+InfluxDB Publisher takes in the flags for the Influx uri and the Influx DB name. The publisher
+will default to the pre-set defaults, identified below, if no uri or DB name is set. However,
+the user is required to at the very least call the `--influx_uri` flag to publish data to Influx.
+
+
+| Flag               | Notes                                                                | Default        |
+|--------------------|----------------------------------------------------------------------|----------------|
+| `--influx_uri`     | The Influx DB address and port. Expects the format hostname:port     | localhost:8086 |
+| `--influx_db_name` | The name of Influx DB database that you wish to publish to or create | perfkit        |
 
 How to Extend PerfKit Benchmarker
 =================
@@ -969,6 +1069,7 @@ Even with lots of comments we make to support more detailed documention.  You wi
 
 Integration Testing
 ===================
+If you wish to run unit or integration tests, ensure that you have `tox >= 2.0.0` installed.
 
 In addition to regular unit tests, which are run via
 [`hooks/check-everything`](hooks/check-everything), PerfKit Benchmarker has

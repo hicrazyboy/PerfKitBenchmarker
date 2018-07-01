@@ -18,6 +18,7 @@ PerfKit Benchmarker creates files under a temporary directory (typically in
 more information).
 """
 
+import functools32
 import os
 import tempfile
 
@@ -31,20 +32,27 @@ _VERSIONS = 'versions'
 
 _TEMP_DIR = os.path.join(tempfile.gettempdir(), _PERFKITBENCHMARKER)
 
+flags.DEFINE_string('temp_dir', _TEMP_DIR, 'Temp directory PKB uses.')
+FLAGS = flags.FLAGS
+
 
 def GetAllRunsDirPath():
   """Gets path to the directory containing the states of all PKB runs."""
-  return os.path.join(_TEMP_DIR, _RUNS)
+  return os.path.join(FLAGS.temp_dir, _RUNS)
 
 
-def GetRunDirPath(run_uri=None):
+# Caching this will have the effect that even if the
+# run_uri changes, the temp dir will stay the same.
+@functools32.lru_cache()
+def GetRunDirPath():
   """Gets path to the directory containing files specific to a PKB run."""
-  return os.path.join(_TEMP_DIR, _RUNS, run_uri or str(flags.FLAGS.run_uri))
+  return os.path.join(
+      FLAGS.temp_dir, _RUNS, str(flags.FLAGS.run_uri))
 
 
 def GetVersionDirPath(version=version.VERSION):
   """Gets path to the directory containing files specific to a PKB version."""
-  return os.path.join(_TEMP_DIR, _VERSIONS, version)
+  return os.path.join(FLAGS.temp_dir, _VERSIONS, version)
 
 
 def CreateTemporaryDirectories():

@@ -25,12 +25,12 @@ by the "aerospike_storage_type" and "data_disk_type" flags.
 import re
 
 from perfkitbenchmarker import configs
-from perfkitbenchmarker import data
 from perfkitbenchmarker import disk
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.linux_packages import aerospike_server
+from perfkitbenchmarker.linux_packages import aerospike_client
 
 
 FLAGS = flags.FLAGS
@@ -48,6 +48,11 @@ flags.DEFINE_integer('aerospike_client_threads_step_size', 8,
 flags.DEFINE_integer('aerospike_read_percent', 90,
                      'The percent of operations which are reads.',
                      lower_bound=0, upper_bound=100)
+flags.DEFINE_integer('aerospike_num_keys', 1000000,
+                     'The number of keys to load Aerospike with. The index '
+                     'must fit in memory regardless of where the actual '
+                     'data is being stored and each entry in the '
+                     'index requires 64 bytes.')
 
 BENCHMARK_NAME = 'aerospike'
 BENCHMARK_CONFIG = """
@@ -58,56 +63,34 @@ aerospike:
       vm_spec: *default_single_core
       disk_spec: *default_500_gb
       vm_count: null
+      disk_count: 0
     client:
       vm_spec: *default_single_core
 """
 
-AEROSPIKE_CLIENT = 'https://github.com/aerospike/aerospike-client-c.git'
-CLIENT_DIR = 'aerospike-client-c'
-CLIENT_VERSION = '4.0.4'
-PATCH_FILE = 'aerospike.patch'
-
 
 def GetConfig(user_config):
   config = configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
-  if (FLAGS.aerospike_storage_type == aerospike_server.DISK and
-      FLAGS.data_disk_type != disk.LOCAL):
-    config['vm_groups']['workers']['disk_count'] = 1
-  else:
-    config['vm_groups']['workers']['disk_count'] = 0
+
+  if FLAGS.aerospike_storage_type == aerospike_server.DISK:
+    if FLAGS.data_disk_type == disk.LOCAL:
+      # Didn't know max number of local disks, decide later.
+      config['vm_groups']['workers']['disk_count'] = (
+          config['vm_groups']['workers']['disk_count'] or None)
+    else:
+      config['vm_groups']['workers']['disk_count'] = (
+          config['vm_groups']['workers']['disk_count'] or 1)
+
   return config
 
 
-def CheckPrerequisites():
+def CheckPrerequisites(benchmark_config):
   """Verifies that the required resources are present.
 
   Raises:
     perfkitbenchmarker.data.ResourceNotFound: On missing resource.
   """
-  data.ResourcePath(PATCH_FILE)
-
-
-def _PrepareClient(client):
-  """Prepare the Aerospike C client on a VM."""
-  client.Install('build_tools')
-  client.Install('lua5_1')
-  client.Install('openssl')
-  clone_command = 'git clone %s'
-  client.RemoteCommand(clone_command % AEROSPIKE_CLIENT)
-  build_command = ('cd %s && git checkout %s && git submodule update --init '
-                   '&& make')
-  client.RemoteCommand(build_command % (CLIENT_DIR, CLIENT_VERSION))
-
-  # Apply a patch to the client benchmark so we have access to average latency
-  # of requests. Switching over to YCSB should obviate this.
-  client.PushDataFile(PATCH_FILE)
-  benchmark_dir = '%s/benchmarks/src/main' % CLIENT_DIR
-  client.RemoteCommand('cp aerospike.patch %s' % benchmark_dir)
-  client.RemoteCommand('cd %s && patch -p1 -f  < aerospike.patch'
-                       % benchmark_dir)
-  client.RemoteCommand('sed -i -e "s/lpthread/lpthread -lz/" '
-                       '%s/benchmarks/Makefile' % CLIENT_DIR)
-  client.RemoteCommand('cd %s/benchmarks && make' % CLIENT_DIR)
+  aerospike_client.CheckPrerequisites()
 
 
 def Prepare(benchmark_spec):
@@ -123,7 +106,7 @@ def Prepare(benchmark_spec):
 
   def _Prepare(vm):
     if vm == client:
-      _PrepareClient(vm)
+      vm.Install('aerospike_client')
     else:
       aerospike_server.ConfigureAndStart(vm, [workers[0].internal_ip])
 
@@ -153,27 +136,31 @@ def Run(benchmark_spec):
     Returns:
       A tuple of average TPS and average latency.
     """
-    write_latency, read_latency = re.findall(
-        r'Overall Average Latency \(ms\) ([0-9]+\.[0-9]+)', output)[-2:]
+    read_latency = re.findall(
+        r'read.*Overall Average Latency \(ms\) ([0-9]+\.[0-9]+)\n', output)[-1]
+    write_latency = re.findall(
+        r'write.*Overall Average Latency \(ms\) ([0-9]+\.[0-9]+)\n', output)[-1]
     average_latency = (
         (FLAGS.aerospike_read_percent / 100.0) * float(read_latency) +
         ((100 - FLAGS.aerospike_read_percent) / 100.0) * float(write_latency))
-    tps = map(int, re.findall(r'total\(tps=([0-9]+)', output)[:-1])
+    tps = map(int, re.findall(r'total\(tps=([0-9]+) ', output))
     return float(sum(tps)) / len(tps), average_latency
 
   load_command = ('./%s/benchmarks/target/benchmarks -z 32 -n test -w I '
-                  '-o B:1000 -k 1000000 -h %s' %
-                  (CLIENT_DIR, ','.join(s.internal_ip for s in servers)))
+                  '-o B:1000 -k %s -h %s' %
+                  (aerospike_client.CLIENT_DIR, FLAGS.aerospike_num_keys,
+                   ','.join(s.internal_ip for s in servers)))
   client.RemoteCommand(load_command, should_log=True)
 
   max_throughput_for_completion_latency_under_1ms = 0.0
   for threads in range(FLAGS.aerospike_min_client_threads,
                        FLAGS.aerospike_max_client_threads + 1,
                        FLAGS.aerospike_client_threads_step_size):
-    load_command = ('timeout 15 ./%s/benchmarks/target/benchmarks '
-                    '-z %s -n test -w RU,%s -o B:1000 -k 1000000 '
+    load_command = ('timeout 60 ./%s/benchmarks/target/benchmarks '
+                    '-z %s -n test -w RU,%s -o B:1000 -k %s '
                     '--latency 5,1 -h %s;:' %
-                    (CLIENT_DIR, threads, FLAGS.aerospike_read_percent,
+                    (aerospike_client.CLIENT_DIR, threads,
+                     FLAGS.aerospike_read_percent, FLAGS.aerospike_num_keys,
                      ','.join(s.internal_ip for s in servers)))
     stdout, _ = client.RemoteCommand(load_command, should_log=True)
     tps, latency = ParseOutput(stdout)

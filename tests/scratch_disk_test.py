@@ -25,7 +25,6 @@ from perfkitbenchmarker import errors
 from perfkitbenchmarker import linux_virtual_machine
 from perfkitbenchmarker import os_types
 from perfkitbenchmarker import providers
-from perfkitbenchmarker import virtual_machine
 from perfkitbenchmarker.configs import benchmark_config_spec
 from perfkitbenchmarker.providers.aws import aws_disk
 from perfkitbenchmarker.providers.aws import aws_virtual_machine
@@ -34,6 +33,7 @@ from perfkitbenchmarker.providers.azure import azure_disk
 from perfkitbenchmarker.providers.azure import azure_virtual_machine
 from perfkitbenchmarker.providers.gcp import gce_disk
 from perfkitbenchmarker.providers.gcp import gce_virtual_machine
+from perfkitbenchmarker.providers.gcp import util
 from tests import mock_flags
 
 
@@ -71,6 +71,8 @@ class ScratchDiskTestMixin(object):
         mock.patch(vm_prefix + '.FormatDisk'))
     self.patches.append(
         mock.patch(vm_prefix + '.MountDisk'))
+    self.patches.append(
+        mock.patch(util.__name__ + '.GetDefaultProject'))
 
     # Patch subprocess.Popen to make sure we don't issue any commands to spin up
     # resources.
@@ -90,7 +92,7 @@ class ScratchDiskTestMixin(object):
     # VM Creation depends on there being a BenchmarkSpec.
     config_spec = benchmark_config_spec.BenchmarkConfigSpec(
         _BENCHMARK_NAME, flag_values=mocked_flags, vm_groups={})
-    self.spec = benchmark_spec.BenchmarkSpec(config_spec, _BENCHMARK_NAME,
+    self.spec = benchmark_spec.BenchmarkSpec(mock.MagicMock(), config_spec,
                                              _BENCHMARK_UID)
     self.addCleanup(context.SetThreadBenchmarkSpec, None)
 
@@ -111,9 +113,10 @@ class ScratchDiskTestMixin(object):
     scratch_disk = vm.scratch_disks[0]
 
     scratch_disk.Create.assert_called_once_with()
-    vm.FormatDisk.assert_called_once_with(scratch_disk.GetDevicePath())
+    vm.FormatDisk.assert_called_once_with(scratch_disk.GetDevicePath(), None)
     vm.MountDisk.assert_called_once_with(
-        scratch_disk.GetDevicePath(), '/mountpoint0')
+        scratch_disk.GetDevicePath(), '/mountpoint0',
+        None, scratch_disk.mount_options, scratch_disk.fstab_options)
 
     disk_spec = disk.BaseDiskSpec(_COMPONENT, mount_point='/mountpoint1')
     vm.CreateScratchDisk(disk_spec)
@@ -131,9 +134,10 @@ class ScratchDiskTestMixin(object):
     scratch_disk = vm.scratch_disks[1]
 
     scratch_disk.Create.assert_called_once_with()
-    vm.FormatDisk.assert_called_with(scratch_disk.GetDevicePath())
+    vm.FormatDisk.assert_called_with(scratch_disk.GetDevicePath(), None)
     vm.MountDisk.assert_called_with(
-        scratch_disk.GetDevicePath(), '/mountpoint1')
+        scratch_disk.GetDevicePath(), '/mountpoint1',
+        None, scratch_disk.mount_options, scratch_disk.fstab_options)
 
     vm.DeleteScratchDisks()
 
@@ -147,7 +151,8 @@ class AzureScratchDiskTest(ScratchDiskTestMixin, unittest.TestCase):
     self.patches.append(mock.patch(azure_disk.__name__ + '.AzureDisk'))
 
   def _CreateVm(self):
-    vm_spec = virtual_machine.BaseVmSpec('test_vm_spec.Azure')
+    vm_spec = azure_virtual_machine.AzureVmSpec(
+        'test_vm_spec.Azure', machine_type='test_machine_type')
     return azure_virtual_machine.DebianBasedAzureVirtualMachine(vm_spec)
 
   def _GetDiskClass(self):
@@ -175,7 +180,9 @@ class AwsScratchDiskTest(ScratchDiskTestMixin, unittest.TestCase):
     self.patches.append(mock.patch(aws_util.__name__ + '.AddDefaultTags'))
 
   def _CreateVm(self):
-    vm_spec = virtual_machine.BaseVmSpec('test_vm_spec.AWS', zone='us-east-1a')
+    vm_spec = aws_virtual_machine.AwsVmSpec('test_vm_spec.AWS',
+                                            zone='us-east-1a',
+                                            machine_type='test_machine_type')
     return aws_virtual_machine.DebianBasedAwsVirtualMachine(vm_spec)
 
   def _GetDiskClass(self):
@@ -183,13 +190,14 @@ class AwsScratchDiskTest(ScratchDiskTestMixin, unittest.TestCase):
 
 
 class GceDeviceIdTest(unittest.TestCase):
+
   def testDeviceId(self):
     with mock.patch(disk.__name__ + '.FLAGS') as disk_flags:
       disk_flags.os_type = 'windows'
       disk_spec = disk.BaseDiskSpec(_COMPONENT, disk_number=1, disk_size=2,
                                     disk_type=gce_disk.PD_STANDARD)
       disk_obj = gce_disk.GceDisk(disk_spec, 'name', 'zone', 'project')
-      self.assertEquals(disk_obj.GetDeviceId(), r'\\.\PHYSICALDRIVE1')
+      self.assertEqual(disk_obj.GetDeviceId(), r'\\.\PHYSICALDRIVE1')
 
 
 if __name__ == '__main__':

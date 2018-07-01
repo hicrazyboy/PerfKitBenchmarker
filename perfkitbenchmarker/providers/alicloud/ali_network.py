@@ -19,17 +19,17 @@ others in the
 same project. See https://developers.google.com/compute/docs/networking for
 more information about AliCloud VM networking.
 """
-import threading
 import json
-import uuid
 import logging
+import threading
+import uuid
 
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import network
+from perfkitbenchmarker import providers
+from perfkitbenchmarker import resource
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.providers.alicloud import util
-from perfkitbenchmarker import resource
-from perfkitbenchmarker import providers
 
 FLAGS = flags.FLAGS
 MAX_NAME_LENGTH = 128
@@ -118,6 +118,7 @@ class AliVSwitch(resource.BaseResource):
         'CreateVSwitch',
         '--VSwitchName %s' % self.name,
         '--ZoneId %s' % self.zone,
+        '--RegionId %s' % self.region,
         '--CidrBlock 10.0.0.0/24',
         '--VpcId %s' % self.vpc_id,
     ]
@@ -189,13 +190,17 @@ class AliSecurityGroup(resource.BaseResource):
     """Returns true if the security group exists."""
     show_cmd = util.ALI_PREFIX + [
         'ecs',
-        'DescribeSecurityGroupAttribute',
+        'DescribeSecurityGroups',
         '--RegionId %s' % self.region,
         '--SecurityGroupId %s' % self.group_id]
     show_cmd = util.GetEncodedCmd(show_cmd)
     stdout, _ = vm_util.IssueRetryableCommand(show_cmd)
-    return 'SecurityGroupId' in json.loads(stdout)
-
+    response = json.loads(stdout)
+    securityGroups = response['SecurityGroups']['SecurityGroup']
+    assert len(securityGroups) < 2, 'Too many securityGroups.'
+    if not securityGroups:
+      return False
+    return True
 
 
 class AliFirewall(network.BaseFirewall):
@@ -207,7 +212,45 @@ class AliFirewall(network.BaseFirewall):
     self.firewall_set = set()
     self._lock = threading.Lock()
 
-  def AllowPort(self, vm, port):
+  def AllowIcmp(self, vm):
+    """Opens the ICMP protocol on the firewall.
+
+    Args:
+      vm: The BaseVirtualMachine object to open the ICMP protocol for.
+    """
+    if vm.is_static:
+      return
+    with self._lock:
+      authorize_cmd = util.ALI_PREFIX + [
+          'ecs',
+          'AuthorizeSecurityGroup',
+          '--IpProtocol ICMP',
+          '--PortRange -1/-1',
+          '--SourceCidrIp 0.0.0.0/0',
+          '--RegionId %s' % vm.region,
+          '--SecurityGroupId %s' % vm.group_id]
+      if FLAGS.ali_use_vpc:
+        authorize_cmd.append('--NicType intranet')
+      authorize_cmd = util.GetEncodedCmd(authorize_cmd)
+      vm_util.IssueRetryableCommand(authorize_cmd)
+
+  def AllowPort(self, vm, start_port, end_port=None):
+    """Opens a port on the firewall.
+
+    Args:
+      vm: The BaseVirtualMachine object to open the port for.
+      start_port: The first local port in a range of ports to open.
+      end_port: The last port in a range of ports to open. If None, only
+        start_port will be opened.
+    """
+
+    if not end_port:
+      end_port = start_port
+
+    for port in range(start_port, end_port + 1):
+      self._AllowPort(vm, port)
+
+  def _AllowPort(self, vm, port):
     """Opens a port on the firewall.
 
     Args:

@@ -1,3 +1,352 @@
+# v1.13.0
+
+Breaking changes:
+- Removed gpus_per_node metadata from stencil2d and hpcg benchmarks (GH-1455)
+- Removed legacy disk metadata (use data_disk\* not scratch_disk\* and removed
+  num_striped_disks + aws_provisioned_iops metadata) (GH-1506)
+
+New features:
+- Added YCSB benchmark for Cloud Spanner (GH-1387 from @haih-g)
+- Added CUDA-enabled HPCG benchmark (GH-1395)
+- Added ManagedRelationalDatabase base classes and tests (GH-1405)
+- Added gpus to GceVmSpec. This is now the only way to create VMs with gpus on GCE due to a gcloud API change (GH-1406)
+- Added flag_zip_defs which functions like flag_matrix_defs, but performs a zip
+  operation on the axes instead of a cross-product (GH-1414)
+- Added TensorFlow Benchmarks. (GH-1420)
+- Added --network_enable_BBR flag (GH-1515)
+- Added pgbench benchmark for managed PostgreSQL (GH-1505)
+
+Enhancements:
+- Added basic auth support for Mesos provider. (GH-1390)
+- Added --failed_run_samples_error_length flag to limit failed run error length (GH-1391)
+- Added `__eq__` and `__ne__` to IntegerList (GH-1395)
+- Added total_free_memory_kb to VirtualMachine class and implemented it for
+  Linux vms (GH-1397)
+- Created hpc_util for a place to share common HPC functions
+- Added --runspec_estimate_spec flag to calculate an estimated spec score (GH-1401)
+- Added all HPCC metrics as samples when running HPCC (GH-1448)
+- Added support for P100 gpus on Google Cloud Platform (GH-1450)
+- Added gpu type to cuda_toolkit_8 metadata (GH-1453)
+- Added num_gpus to cuda_toolkit_8 metadata (GH-1455)
+- Added range mode to gpu_pcie_bandwidth which calculates average bandwidth over
+  a provided range of transfer sizes (GH-1482)
+- Added size support to fio_benchmark scenarios (GH-1489)
+- Added RemoteCommandWithReturnValue (GH-1516)
+
+Bug fixes and maintenance updates:
+- Fixed provision phase of memcached_ycsb benchmark for non-managed memcached instances (GH-1384)
+- Fixed GPU benchmarks on GCE to work with new GPU API (GH-1407)
+- Changed cuda_toolkit_8 to use the gpu-specific base clock speed as the default (GH-1453)
+- Changed default AWS P2 region for gpu benchmarks (GH-1454)
+- Fix multi-threading issue in fio.job filename (GH-1474)
+- Decreased speccpu2006 default disk size to 50gb (GH-1484)
+- Updated azure library version 1.0.3 for blob storage (GH-1491)
+- Added azure host_caching to metadata (GH-1500)
+- Fixed fio histograms when generated with numjobs>1 (GH-1501)
+
+# v1.12.0
+
+Breaking changes:
+- Azure CLI updated to 2.0 (GH-1359)
+- Update gflags to version 3.1.1 (GH-1322)
+
+New features:
+- Azure container service (GH-1361)
+- Add Reboot() method to BaseOsMixin (GH-1356)
+- Add container cluster classes (GH-1355)
+- Optional `--completion_status_file` flag to write the completion status of every config to a json file (GH-1349)
+- Add `--gcp_min_cpu_platform` flag (GH-1336)
+- Add GCP sole tenancy support (GH-1333)
+- Add SHOC package (GH-1332)
+- Add Stencil2D benchmark (GH-1332)
+- Managed memcache service abstraction and a backend for AWS ElastiCache (GH-1235)
+- Add Apache Beam benchmark (GH-1324)
+- Add `image_project` to GCP YAML config options (GH-1319)
+- Add support for AWS i3 (GH-1308)
+- Optionally create failed run samples with --create_failed_run_samples (GH-1363)
+- Add --storage_size flag for mysql_service benchmark (GH-1360 from @sspano)
+
+Enhancements:
+- Add optional step parameter to IntegerList (GH-1330)
+- Upgrade to NVIDIA's latest version of CUDA Toolkit 8 (GH-1304)
+- Add ID attribute to GCE VMs (GH-1318)
+- Add ability to install netperf from local tar file (GH-1364)
+
+Bug fixes and maintenance updates:
+- Fix up README.md - incorrect command line example and added note on Amazon ES publisher (GH-1350 from @Lirt)
+- Fix up README.md - remove outdated comments about GCP requirements (GH-1354 from @sspano)
+- Fix creating instance with local SSD using NVMe interface (GH-1287)
+- Make flag values consistent with gcloud CLI "SCSI" and "NVME" (GH-1287)
+- Store os types in list instead of tuple so that it can be extended by third parties (GH-1348)
+- Don't create host during VM Create if `num_vms_per_host` is specified (GH-1352)
+- Fix up kubernetes provider (GH-1351)
+- Add `--region` to describe/cancel spot-instance-request commands (GH-1347)
+- Install sysbench05plus package in a separate path from sysbench (GH-1338)
+- Change `--openstack_additional_flags` to be a list flag (GH-1340)
+- Move gflags installation from netperf benchmark to a package (GH-1341)
+- Move package installation of netperf from benchmark to a package (GH-1341)
+- Use snake_case gflags APIs (GH-1328)
+- Check if apt-update has been called in InstallPackages, and call it if it has not been (GH-1334)
+- Fix broken regular expression in blazemark benchmark (GH-1311)
+- Fix CloudSuite license page link (GH-1323)
+- Update hadoop version (GH-1327)
+- Use regional storage class for GCS buckets instead of DRA (GH-1326)
+- Fix gflags FLAGS object initialization in tests (GH-1313)
+- Fix bug with exception name in `azure_network.py` (GH-1314)
+- Always set GPU clock speed in cuda toolkit installation (GH-1321)
+- Specify `image_project` in `gpu_pcie_bandwidth` benchmark config (GH-1321)
+- Move gpu clock speed logic to `cuda_toolkit_8` module (GH-1279)
+- Add timeout to netperf remote script (GH-1306)
+- Don't assume that gcloud is in PATH in providers.gcp.util.GetDefaultProject (GH-1366)
+- Make AWS S3 bucket deletion retryable (GH-1343)
+- Empty bucket at the end of the Run stage of the object_storage_service benchmark (GH-1343)
+
+# v1.11.0
+
+External contributions:
+- Add ability to publish to InfluxDB (thanks @besanradwan GH-1278)
+- Always set internal IP-Address on OpenStack VMs (thanks @yremmet GH-1228)
+- Add CloudSuite data-analytics benchmark (thanks @ivonindza GH-1285)
+- Update README.md (thanks @ianmaddox GH-1291)
+- Fix a small typo in the anti-affinity FLAG lookup (thanks @joelio GH-1284)
+- Deprecate flag openstack_volume_size (thanks @vhe182 GH-1220)
+- Add ProfitBricks cloud api v3 support (thanks @aajdinov GH-1264)
+- Enable OpenStack Cinder Volume Type Option (thanks @rossmartyn04 GH-1197)
+
+New features:
+- Add dpb_wordcount_benchmark (GH-1253)
+
+Enhancements:
+- Add helpmatch usage instructions (GH-1268)
+- Add openStack_volume_type option decoder (GH-1267)
+- Upgrade OpenStack CLI dependency to 3.6.0 (GH-1265)
+- Add object storage service cold reads support, various improvements (GH-1290, GH-1274)
+- Add support for AWS Spot Instances (GH-1288)
+- Bump fio version to v2.17 and enable histogram (GH-1300)
+- Let publisher.py republish already-collected samples (GH 1299)
+- Allow specifying temp dir (GH-1277)
+- Add --json_write_mode (GH-1276)
+- Allow override hpcc binaries (GH-1269)
+
+Bug fixes and maintenance updates:
+- Lock samples json file before writing to it (GH-1265)
+- Fixed exception caused by publishers being None (GH-1302)
+- Add error and warning log level options to reduce log size (GH-1301)
+- Use force for DigitalOcean deletes (GH-1281)
+- Print helpmatch usage instructions (GH-1280)
+- Fix fio parser regex (GH-1275)
+- Specify AWS region when calling describe-images (GH 1273)
+- Make CheckPrerequisites more comprehensive (GH-1272)
+- Use image_project flag in disk creation if set (GH-1271)
+- Minor bug fixes and configuration improvements (GH-1262)
+
+
+# v1.10.0
+
+External contributions:
+- Re-write flag_util_test.py so it's easier to read (thanks @yilei GH-1244)
+- Fix bug that prevents running bonnie++ on Azure (thanks @rgodha GH-1218)
+- Add kernel compile benchmark (thanks @maggiejiao GH-1215, GH-1255)
+- Change the documentation to reflect that work should be on master (thanks
+  @besanradwan GH-1209)
+- Add flags to capture latency, bandwidth and IOPS logs in Fio benchmark (thanks @meteorfox GH-1205)
+- Re-add 'vm_util' object to fix broken master branch (thanks @vhe182 GH-1196)
+- Add EPEL Repo to Silo Installation (thanks @akrzos GH-1153)
+
+New features:
+- Add GPU PCIe bandwidth test (GH-1234, GH-1250, GH-1252, GH-1254)
+- Add blazemark (GH-1145)
+- Add simple memcached ycsb benchmark based on aerospike ycsb benchmark (GH-1199)
+- Add scimark2 installation package (GH-1185)
+
+Enhancements:
+- Use FLAGS.aws_user_name if set for Rhel (GH-1249)
+- Fio enhancements (GH-1246)
+- Use aes128-ctr if aes128-cbc isn't available (GH-1242)
+- Make aeropsike able to run with raw devices on static vms (GH-1243)
+- Add some metadata to netperf samples (GH-1236)
+- Remove unneeded Azure code and add availability sets (GH-1232)
+- Add cassandra read concurrency flag (GH-1233)
+- Add a metadata attribute 'ssd_count' to spark_service (GH-1229)
+- Add a metadata attribute 'spark_svc_cloud' to spark_service (GH-1226)
+- Add ability to specify boot_disk_size in AWS vm spec (GH-1231)
+- Add a metadata attribute 'spark_svc_cloud' (GH-1236)
+- Set a default zone for the spark test to allow for subnet creation (GH-1222)
+- Update the location of the spark examples jar on the emr cluster (GH-1222)
+- Persist package installation across reboots (GH-1185)
+- Allow mongodb_ycsb to specify readahead settings (GH-1256)
+
+Bug fixes and maintenance updates:
+- Close Aersospike connection in 1 second (GH-1241)
+- Fix bug with having multiple Azure data disks (GH-1223)
+- Fix aws spark service (GH-1222)
+- Add some git ignore entries (GH-1222)
+- Fix gcs credential conflict (GH-1221)
+- Fix bug with run_processes (GH-1212)
+- Remove collector from RunBenchmarkTask args (GH-1210)
+- Add the minimum tox version to the "tox is not installed" message (GH-1201)
+- Move sysbench05plus path prefix logic into package (GH-1185)
+- Fix bug with specifying Azure image (GH-1204)
+- Fix two files that were failing boilerplate check (GH-1203)
+- Update README.md (GH-1200)
+
+# 1.9.0
+
+New features:
+- Add config file imports and allow for circular imports and add documentation (GH-1163)
+- Add a way to run benchmarks in parallel (GH-1192)
+
+Enhancements:
+- ContainerizedDebianMixin: Ping to a fixed docker image and remove the sudo hack (GH-1171)
+- Auto detect  openjdk, libsnappy package versions (GH-1181)
+- Add flags to govern subnet creation and Optionally create only 1 subnet (GH-1182)
+- Install docker images as packages (GH-1184)
+- Call FLAGS.get_help if it's available (GH-1187)
+- Publish boot time samples for all tests (GH-1156)
+
+Bugfixes and maintenance updates:
+- Update requirements.txt to set version of contextlib2 (GH-1164)
+- Fix bug with config flags (GH-1165)
+- Updated the cloudsuite web-serving benchmark (thanks @nooshin-mirzadeh, GH-1166)
+- Fix load command parsing (GH-1168)
+- openstack: Open all TCP and UDP ports for the internal network (GH-1169)
+- Fix aerospike metadata (GH-1170)
+- Adjust aerospike default replication factor (GH-1172)
+- Try replacing FlagValues._flags instead of FlagValues.FlagDict first (GH-1175)
+- Fix ycsb aggregator (GH-1176)
+- Fix bug during cleanup phase of object_storage_service benchmark (GH-1178)
+- Netperf thinktime fixes and support think time in nanoseconds instead of microseconds (GH-1179, GH-1186, GH-1188)
+- Fix sysbench05plus installation on ubuntu16.04 (GH-1183)
+- Fix race condition in Aerospike benchmark (GH-1190)
+- Clean up some pickling, unpickling issues (GH-1191)
+- Calculate free ram with more robust /proc/meminfo instead of `free`(GH-1194)
+- Fix multithread netperf (GH-1149)
+- Multiple fixes and refactoring of the linux package management on vms (GH-1152)
+- Fix dstat metadata in Analyze (GH-1154)
+- Obey flag overrides for static vm specs (GH-1155)
+- Fix links in README file for OpenStack and Cloudstack setup steps (thanks @shakhat, GH-1157)
+- Fix issue with GetConfig using flags (GH-1160)
+- Remove scratch disk from netperf and object_storage_service benchmark (GH-1147, GH-1148)
+- Netperf changes to add num_streams metadata to samples (GH-1177)
+
+# 1.8.1
+
+Bugfixes and maintanence updates:
+- Fixed default machine type for Azure (GH-1161)
+
+# 1.8.0
+
+New features:
+- Multithreaded netperf benchmark (GH-1141, GH-1144)
+- Terasort benchmark using spark service infrastructure (GH-1104)
+- Support 10 or more disks on Azure (GH-1102)
+- Add sysctl and set_files flags (GH-1096)
+- Support DigitalOcean block storage (GH-1092)
+- Add cloudsuite_data_serving_rec_count and cloudsuite_data_serving_op_count parameters to cloudsuite_data_serving benchmark (GH-1091)
+- Add support for setting GCE boot disk size and type (GH-1106)
+- Add flag to skip reload on ycsb benchmark (GH-1108)
+- Support for AWS dedicated hosts (GH-1109)
+- Object storage multistream write-only scenario (GH-1123)
+- Allow multiple configs for the same benchmark in the same file (GH-1126)
+- Add flat that allows run retries (GH-1129)
+- Add fio_parameters flag (GH-1131)
+- Add config matrices (GH-1134)
+- Add events at the beginning and end of benchmarks (GH-1135)
+- Add extra_zones flag to pkb (GH-1137)
+- Add flag matrix filters (GH-1138)
+- Support allowing port ranges on Firewall.AllowPort (GH-1139)
+- Add static vm tags (GH-1142)
+
+Breaking changes:
+- Because of GH-1112, region names have changed.
+
+Enhancements:
+- Allow speccpu to run individual test (GH-1113)
+- Use Azure resource management mode (GH-1112)
+- GCP networks use subnets (GH-1087)
+- Add top level flags key to configs (GH-1125)
+- Precise resource usage for YCSB benchmarks (GH-1127)
+
+Bugfixes and maintanence updates:
+- Fix bugs with Terasort (GH-1136)
+- Don't run container commands as sudo with ContainerizedDebianMixin (GH-1130)
+- Automatically use amazon linux if os_type is rhel (GH-1124)
+- Removed Panda as a dependency (GH-1118, GH-1119)
+- Allow flag_util.ParseKeyValuePairs values to have colons in them (GH-1117)
+- Add ycsb to data directory (GH-1116)
+- Fix bug in mongodb_ycsb_benchmark cleanup (GH-1115)
+- Fix bug where static VM disk specs were overridden (GH-1105)
+- Use string formatting instead of addition to concatenate (GH-1103)
+- Fixed regression with fio flag (GH-1097)
+- Fix flags in static vm files (GH-1093)
+- Fix wait_for_command.py: wait for status file to avoid race condition (GH-1090)
+
+# 1.7.0
+
+New features:
+* Add ProfitBricks provider (thanks @tjb1019, GH-1005)
+* Add YCSB JDBC benchmark (thanks @k1xme, GH-1049)
+* Add support for st1 and sc1 disks on EBS (GH-1067)
+
+Breaking changes:
+* Change default gce_migrate_on_maintenance to True (GH-1069)
+
+Enhancements:
+* Update OpenStack provider to use OpenStacks CLI instead of python library
+  (thanks @meteorfox, GH-942)
+* Improve side-by-side tool (GH-1034)
+* Specify flags to metadata (GH-1047)
+* Allow Java version for Java benchmarks to be selected via command line (GH-1051)
+* Add numjobs runtime option to fio_benchmark (GH-1066)
+* Add netperf histogram support (GH-1072)
+* Add multi-vm support for object_storage_service_benchmark (GH-1074)
+* Add support for custom s3 endpoints for object_storage_service_benchmark
+  (GH-1078)
+* Add user-defined metadata for vms (GH-1080)
+
+Bugfixes and maintenance updates:
+* Refactor object_storage_service_benchmark (GH-1023)
+* Support overriding ycsb_client_vms in benchmark spec (thanks @k1xme, GH-1042)
+* Update YCSB to 0.9.0 and support latest logging format (thanks @k1xme, GH-1043)
+* Fix zones flag (GH-1044)
+* Update Bigtable to v2 API (thanks @tswast, GH-1045)
+* Update maven version to 3.3.9 (GH-1046)
+* Start background workload in prepare stage and stop in cleanup stage (GH-1048)
+* Minor fixes in flag description (GH-1052)
+* Only upload files needed for API testing script for
+  object_storage_service_benchmark (GH-1053)
+* Fix redis_ycsb benchmark to use multiple processes (GH-1062, GH-1068, GH-1070)
+* Fix bug with custom machine types configs (GH-1077)
+* Fix in documentation of ParseTimeCommandResult (thanks @skorgu, GH-1079)
+* Replace Pandas dependency with Numpy (GH-1081)
+* Turn off OpenBlas threading, improving HPCC on large vms (GH-1084)
+* Cleanup object_storage_serivce benchmark (GH-1085)
+* Cleanup aerospike_ycsb benchmarks (GH-1086)
+
+# 1.6.0
+
+New features:
+* Apache Spark benchmark (GH-1014,GH-1011)
+* Cloudsuite dataserving benchmark (thanks @ustiugov, GH-930)
+
+Enhancements:
+* Optionally publish VM hostnames in metadata (GH-1020)
+* Control which netperf benchmarks are run via flag (GH-1029)
+* Netperf benchmark reports min and max latency (GH-1013)
+* Add multichase to the google benchmark set (GH-1018)
+* Update Cloudsuite web serving benchmark (thanks @ivonindza, @GH-998)
+* Object storage updates (GH-987)
+* Repeat Run stage (GH-1032)
+
+Bugfixes and maintenance updates:
+* Fix path to cassandra-cli (thanks @adamisrael, GH-1006)
+* Update ycsb version; affects cloud_bigtable_ycsb_benchmark, hbase_ycsb
+  (GH-1021, GH-1025, GH-1031)
+* Use latest gsutil version (GH-1012)
+* Remove duplicate requirements files (GH-975)
+* Update openblas version (GH-1003)
+* Background workload refactor (GH-1033)
+
 # 1.5.0
 
 New features:
@@ -767,7 +1116,6 @@ Fixes:
 * Fixed corner cases in SPEC 2006 causing it to fail on large instances.
 
 # v0.1
-
 * Support static vms (i.e. machine not provisioned via Cloud APIs. We call all machines VMs). All static VMs provided will be used before any non-static VMs are provisioned.
 * See static_virtual_machine.py for detailed description.
 * Added copy benchmark.

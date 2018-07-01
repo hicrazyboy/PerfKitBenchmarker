@@ -1,4 +1,4 @@
-# Copyright 2015 PerfKitBenchmarker Authors. All rights reserved.
+# Copyright 2017 PerfKitBenchmarker Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,24 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import base64
+"""Contains code related to lifecycle management of Kubernetes Pods."""
+
 import json
 import logging
-import random
+import posixpath
 
+from perfkitbenchmarker import context
 from perfkitbenchmarker import disk
+from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
+from perfkitbenchmarker import kubernetes_helper
+from perfkitbenchmarker import providers
 from perfkitbenchmarker import virtual_machine, linux_virtual_machine
 from perfkitbenchmarker import vm_util
-from perfkitbenchmarker import providers
+from perfkitbenchmarker.providers.aws import aws_virtual_machine
+from perfkitbenchmarker.providers.azure import azure_virtual_machine
+from perfkitbenchmarker.providers.gcp import gce_virtual_machine
 from perfkitbenchmarker.providers.kubernetes import kubernetes_disk
-from perfkitbenchmarker.vm_util import OUTPUT_STDOUT as STDOUT,\
-    OUTPUT_STDERR as STDERR, OUTPUT_EXIT_CODE as EXIT_CODE
+from perfkitbenchmarker.vm_util import OUTPUT_STDOUT as STDOUT
 
 FLAGS = flags.FLAGS
 
-DEFAULT_ZONE = 'k8s'
-SECRET_PREFIX = 'public-key-'
 UBUNTU_IMAGE = 'ubuntu-upstart'
 SELECTOR_PREFIX = 'pkb'
 
@@ -39,51 +43,61 @@ class KubernetesVirtualMachine(virtual_machine.BaseVirtualMachine):
   Object representing a Kubernetes POD.
   """
   CLOUD = providers.KUBERNETES
+  DEFAULT_IMAGE = None
+  CONTAINER_COMMAND = None
 
   def __init__(self, vm_spec):
     """Initialize a Kubernetes virtual machine.
 
     Args:
-      vm_spec: virtual_machine.BaseVirtualMachineSpec object of the vm.
+      vm_spec: KubernetesPodSpec object of the vm.
     """
     super(KubernetesVirtualMachine, self).__init__(vm_spec)
     self.num_scratch_disks = 0
     self.name = self.name.replace('_', '-')
     self.user_name = FLAGS.username
-    self.image = self.image or UBUNTU_IMAGE
+    self.image = self.image or self.DEFAULT_IMAGE
+    self.resource_limits = vm_spec.resource_limits
+    self.resource_requests = vm_spec.resource_requests
+
+  def GetResourceMetadata(self):
+    metadata = super(KubernetesVirtualMachine, self).GetResourceMetadata()
+    if self.resource_limits:
+      metadata.update({
+          'pod_cpu_limit': self.resource_limits.cpus,
+          'pod_memory_limit_mb': self.resource_limits.memory,
+      })
+    if self.resource_requests:
+      metadata.update({
+          'pod_cpu_request': self.resource_requests.cpus,
+          'pod_memory_request_mb': self.resource_requests.memory,
+      })
+    return metadata
 
   def _CreateDependencies(self):
     self._CheckPrerequisites()
-    self._CreateSecret()
     self._CreateVolumes()
 
   def _DeleteDependencies(self):
     self._DeleteVolumes()
-    self._DeleteSecret()
 
   def _Create(self):
     self._CreatePod()
-    self._CreateService()
     self._WaitForPodBootCompletion()
-    self._WaitForEndpoint()
 
   @vm_util.Retry()
   def _PostCreate(self):
-    self._SetSshDetails()
+    self._GetInternalIp()
     self._ConfigureProxy()
     self._SetupDevicesPaths()
 
   def _Delete(self):
     self._DeletePod()
-    self._DeleteService()
 
   def _CheckPrerequisites(self):
     """
     Exits if any of the prerequisites is not met.
     """
-    if not FLAGS.kubernetes_nodes:
-      raise Exception('Kubernetes Nodes IP addresses not found. Please specify'
-                      'them using --kubernetes_nodes flag. Exiting.')
     if not FLAGS.kubectl:
       raise Exception('Please provide path to kubectl tool using --kubectl '
                       'flag. Exiting.')
@@ -99,29 +113,10 @@ class KubernetesVirtualMachine(virtual_machine.BaseVirtualMachine):
     """
     Creates a POD (Docker container with optional volumes).
     """
-    create_cmd = [FLAGS.kubectl, '--kubeconfig=%s' % FLAGS.kubeconfig,
-                  'create', '-f', '-']
     create_rc_body = self._BuildPodBody()
-    output = vm_util.IssueCommand(create_cmd, input=create_rc_body)
-    if output[EXIT_CODE]:
-      raise Exception("Creating POD failed: %s" % output[STDERR])
-    logging.info(output[STDOUT].rstrip())
-
-  def _CreateService(self):
-    """
-    Creates a Service (POD accessor).
-    """
-    # Intentionally setting validation flag to false as the kubectl binary
-    # drops the request if nodePort parameter is not provided. However, it
-    # is not needed - in such case nodePort will be automatically drawn
-    # from the pool of ports.
-    create_cmd = [FLAGS.kubectl, '--kubeconfig=%s' % FLAGS.kubeconfig,
-                  'create', '--validate=false', '-f', '-']
-    create_svc_body = self._BuildServiceBody()
-    output = vm_util.IssueCommand(create_cmd, input=create_svc_body)
-    if output[EXIT_CODE]:
-      raise Exception("Creating Service failed: %s" % output[STDERR])
-    logging.info(output[STDOUT].rstrip())
+    logging.info('About to create a pod with the following configuration:')
+    logging.info(create_rc_body)
+    kubernetes_helper.CreateResource(create_rc_body)
 
   @vm_util.Retry(poll_interval=10, max_retries=100, log_errors=False)
   def _WaitForPodBootCompletion(self):
@@ -144,26 +139,6 @@ class KubernetesVirtualMachine(virtual_machine.BaseVirtualMachine):
     raise Exception("POD %s is not running. Retrying to check status." %
                     self.name)
 
-  @vm_util.Retry(poll_interval=10, max_retries=20, log_errors=False)
-  def _WaitForEndpoint(self):
-    """
-    Waits till Service is matched with a POD. Only after this we will be able
-    to connect to container via SSH.
-    """
-    logging.info("Waiting for endpoint %s" % self.name)
-    exists_cmd = [FLAGS.kubectl, '--kubeconfig=%s' % FLAGS.kubeconfig, 'get',
-                  'endpoints', '-o=json', self.name]
-
-    endpoint, _, _ = vm_util.IssueCommand(exists_cmd, suppress_warning=True)
-    if endpoint:
-      endpoint = json.loads(endpoint)
-      if len(endpoint['subsets']) > 0:
-        logging.info("Endpoint found. Service is successfully matched"
-                     "with POD.")
-        return
-
-    raise Exception("Endpoint %s not found. Retrying." % self.name)
-
   def _DeletePod(self):
     """
     Deletes a POD.
@@ -171,15 +146,6 @@ class KubernetesVirtualMachine(virtual_machine.BaseVirtualMachine):
     delete_pod = [FLAGS.kubectl, '--kubeconfig=%s' % FLAGS.kubeconfig,
                   'delete', 'pod', self.name]
     output = vm_util.IssueCommand(delete_pod)
-    logging.info(output[STDOUT].rstrip())
-
-  def _DeleteService(self):
-    """
-    Deletes a Service.
-    """
-    delete_service = [FLAGS.kubectl, '--kubeconfig=%s' % FLAGS.kubeconfig,
-                      'delete', 'service', self.name]
-    output = vm_util.IssueCommand(delete_service)
     logging.info(output[STDOUT].rstrip())
 
   @vm_util.Retry(poll_interval=10, max_retries=20)
@@ -208,75 +174,23 @@ class KubernetesVirtualMachine(virtual_machine.BaseVirtualMachine):
     Deletes volumes.
     """
     for scratch_disk in self.scratch_disks[:]:
-      scratch_disk._Delete()
+      scratch_disk.Delete()
       self.scratch_disks.remove(scratch_disk)
-
-  def _CreateSecret(self):
-    """
-    Creates a Kubernetes secret which will store public key.
-    It will be used during during POD creation.
-    """
-    cat_cmd = ['cat', vm_util.GetPublicKeyPath()]
-    key_file, _ = vm_util.IssueRetryableCommand(cat_cmd)
-    encoded_public_key = base64.b64encode(key_file)
-    template = {
-        "kind": "Secret",
-        "apiVersion": "v1",
-        "metadata": {
-            "name": SECRET_PREFIX + self.name
-        },
-        "data": {
-            "authorizedkey": encoded_public_key
-        }
-    }
-    create_secret_body = json.dumps(template)
-    create_secret = [FLAGS.kubectl, '--kubeconfig=%s' % FLAGS.kubeconfig,
-                     'create', '-f', '-']
-    output = vm_util.IssueCommand(create_secret, input=create_secret_body)
-    if output[EXIT_CODE]:
-      raise Exception("Creating secret failed: %s" % output[STDERR])
-    logging.info(output[STDOUT].rstrip())
-
-  def _DeleteSecret(self):
-    """
-    Deletes a secret.
-    """
-    delete_secret = [FLAGS.kubectl, '--kubeconfig=%s' % FLAGS.kubeconfig,
-                     'delete', 'secret', SECRET_PREFIX + self.name]
-    result = vm_util.IssueCommand(delete_secret)
-    logging.info(result[STDOUT].rstrip())
 
   def DeleteScratchDisks(self):
     pass
 
-  def _SetSshDetails(self):
+  def _GetInternalIp(self):
     """
-    SSH to containers is done through one of Kubernetes Nodes:
-    - SSH IP address is the address of one of the Nodes,
-    - SSH port is assigned to Kubernetes Service matched with this container.
+    Gets the POD's internal ip address.
     """
-
-    get_service_cmd = [FLAGS.kubectl, '--kubeconfig=%s' % FLAGS.kubeconfig,
-                       'get', 'service', self.name, '-o', 'json']
-    stdout, _, _ = vm_util.IssueCommand(get_service_cmd, suppress_warning=True)
-    service = json.loads(stdout)
-    ports = service.get('spec', {}).get('ports', [])
-
-    if not ports:
-      raise Exception("Port of service %s not found. Retrying." % self.name)
-    self.ssh_port = ports[0]['nodePort']
-
-    get_pod_cmd = [FLAGS.kubectl, '--kubeconfig=%s' % FLAGS.kubeconfig,
-                   'get', 'pod', self.name, '-o', 'json']
-    stdout, _, _ = vm_util.IssueCommand(get_pod_cmd, suppress_warning=True)
-    pod = json.loads(stdout)
-    pod_ip = pod.get('status', {}).get('podIP', None)
+    pod_ip = kubernetes_helper.Get(
+        'pods', self.name, '', '.status.podIP')
 
     if not pod_ip:
       raise Exception("Internal POD IP address not found. Retrying.")
 
     self.internal_ip = pod_ip
-    self.ip_address = random.choice(FLAGS.kubernetes_nodes)
 
   def _ConfigureProxy(self):
     """
@@ -325,9 +239,26 @@ class KubernetesVirtualMachine(virtual_machine.BaseVirtualMachine):
         "spec": {
             "volumes": volumes,
             "containers": [container],
-            "dnsPolicy": "ClusterFirst"
+            "dnsPolicy": "ClusterFirst",
         }
     }
+    if FLAGS.kubernetes_anti_affinity:
+      template["spec"]["affinity"] = {
+          "podAntiAffinity": {
+              "requiredDuringSchedulingIgnoredDuringExecution": [{
+                  "labelSelector": {
+                      "matchExpressions": [{
+                          "key": "pkb_anti_affinity",
+                          "operator": "In",
+                          "values": [""],
+                      }],
+                  },
+                  "topologyKey": "kubernetes.io/hostname",
+              }],
+          },
+      }
+      template["metadata"]["labels"]["pkb_anti_affinity"] = ""
+
     return json.dumps(template)
 
   def _BuildVolumesBody(self):
@@ -335,13 +266,6 @@ class KubernetesVirtualMachine(virtual_machine.BaseVirtualMachine):
     Constructs volumes-related part of POST request to create POD.
     """
     volumes = []
-    secret_volume = {
-        "name": "ssh-details",
-        "secret": {
-            "secretName": SECRET_PREFIX + self.name
-        }
-    }
-    volumes.append(secret_volume)
 
     for scratch_disk in self.scratch_disks:
       scratch_disk.AttachVolumeInfo(volumes)
@@ -352,65 +276,279 @@ class KubernetesVirtualMachine(virtual_machine.BaseVirtualMachine):
     """
     Constructs containers-related part of POST request to create POD.
     """
-
-    # Kubernetes 'secret' mechanism is used to pass public key.
-    # Unfortunately, Kubernetes doesn't allow to specify underline
-    # character in file name. Thus 'authorizedkey' is passed which
-    # is later properly moved to 'authorized_keys'.
-    public_key = "/bin/mkdir /root/.ssh\n" + \
-                 "mv /tmp/authorizedkey /root/.ssh/authorized_keys\n"
-    container_boot_commands = public_key + "/usr/sbin/sshd -D"
-
+    registry = getattr(context.GetThreadBenchmarkSpec(), 'registry', None)
+    if (not FLAGS.static_container_image and
+        registry is not None):
+      image = registry.GetFullRegistryTag(self.image)
+    else:
+      image = self.image
     container = {
-        "command": [
-            "bash",
-            "-c",
-            container_boot_commands
-        ],
-        "image": self.image,
+        "image": image,
         "name": self.name,
         "securityContext": {
             "privileged": FLAGS.docker_in_privileged_mode
         },
         "volumeMounts": [
-            {
-                "name": "ssh-details",
-                "mountPath": "/tmp"
-            }
         ]
     }
 
     for scratch_disk in self.scratch_disks:
       scratch_disk.AttachVolumeMountInfo(container['volumeMounts'])
 
+    resource_body = self._BuildResourceBody()
+    if resource_body:
+      container['resources'] = resource_body
+
+    if self.CONTAINER_COMMAND:
+      container['command'] = self.CONTAINER_COMMAND
+
     return container
 
-  def _BuildServiceBody(self):
-    """
-    Constructs body of a POST request to create a Service.
-    """
+  def _BuildResourceBody(self):
+    """Constructs a dictionary that specifies resource limits and requests.
 
-    service = {
-        "kind": "Service",
-        "apiVersion": "v1",
-        "metadata": {
-            "name": self.name
-        },
-        "spec": {
-            "ports": [
-                {
-                    "port": self.ssh_port
-                }
-            ],
-            "selector": {
-                SELECTOR_PREFIX: self.name
-            },
-            "type": "NodePort"
-        }
+    The syntax for including GPUs is specific to GKE and is likely to
+    change in the future.
+    See https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus
+
+    Returns:
+      kubernetes pod resource body containing pod limits and requests.
+    """
+    resources = {
+        'limits': {},
+        'requests': {},
     }
-    return json.dumps(service)
+
+    if self.resource_requests:
+      resources['requests'].update({
+          'cpu': str(self.resource_requests.cpus),
+          'memory': '{0}Mi'.format(self.resource_requests.memory),
+      })
+
+    if self.resource_limits:
+      resources['limits'].update({
+          'cpu': str(self.resource_limits.cpus),
+          'memory': '{0}Mi'.format(self.resource_limits.memory),
+      })
+
+    if self.gpu_count:
+      gpu_dict = {
+          'nvidia.com/gpu': str(self.gpu_count)
+      }
+      resources['limits'].update(gpu_dict)
+      resources['requests'].update(gpu_dict)
+
+    result_with_empty_values_removed = (
+        {k: v for k, v in resources.iteritems() if v})
+    return result_with_empty_values_removed
 
 
 class DebianBasedKubernetesVirtualMachine(KubernetesVirtualMachine,
                                           linux_virtual_machine.DebianMixin):
   DEFAULT_IMAGE = UBUNTU_IMAGE
+
+  def RemoteHostCommandWithReturnCode(self, command,
+                                      should_log=False, retries=None,
+                                      ignore_failure=False, login_shell=False,
+                                      suppress_warning=False, timeout=None):
+    """Runs a command in the Kubernetes container."""
+    cmd = [FLAGS.kubectl, '--kubeconfig=%s' % FLAGS.kubeconfig, 'exec', '-i',
+           self.name, '--', '/bin/bash', '-c', command]
+    stdout, stderr, retcode = vm_util.IssueCommand(
+        cmd, force_info_log=should_log,
+        suppress_warning=suppress_warning, timeout=timeout)
+    if not ignore_failure and retcode:
+      error_text = ('Got non-zero return code (%s) executing %s\n'
+                    'Full command: %s\nSTDOUT: %sSTDERR: %s' %
+                    (retcode, command, ' '.join(cmd),
+                     stdout, stderr))
+      raise errors.VirtualMachine.RemoteCommandError(error_text)
+    return stdout, stderr, retcode
+
+  def MoveHostFile(self, target, source_path, remote_path=''):
+    """Copies a file from one VM to a target VM.
+
+    Args:
+      target: The target BaseVirtualMachine object.
+      source_path: The location of the file on the REMOTE machine.
+      remote_path: The destination of the file on the TARGET machine, default
+          is the home directory.
+    """
+    file_name = vm_util.PrependTempDir(posixpath.basename(source_path))
+    self.RemoteHostCopy(file_name, source_path, copy_to=False)
+    target.RemoteHostCopy(file_name, remote_path)
+
+  def RemoteHostCopy(self, file_path, remote_path='', copy_to=True):
+    """Copies a file to or from the VM.
+
+    Args:
+      file_path: Local path to file.
+      remote_path: Optional path of where to copy file on remote host.
+      copy_to: True to copy to vm, False to copy from vm.
+
+    Raises:
+      RemoteCommandError: If there was a problem copying the file.
+    """
+    if copy_to:
+      file_name = posixpath.basename(file_path)
+      src_spec, dest_spec = file_path, '%s:%s' % (self.name, file_name)
+    else:
+      remote_path, _ = self.RemoteCommand('readlink -f %s' % remote_path)
+      remote_path = remote_path.strip()
+      src_spec, dest_spec = '%s:%s' % (self.name, remote_path), file_path
+    cmd = [FLAGS.kubectl, '--kubeconfig=%s' % FLAGS.kubeconfig,
+           'cp', src_spec, dest_spec]
+    stdout, stderr, retcode = vm_util.IssueCommand(cmd)
+    if retcode:
+      error_text = ('Got non-zero return code (%s) executing %s\n'
+                    'STDOUT: %sSTDERR: %s' %
+                    (retcode, ' '.join(cmd), stdout, stderr))
+      raise errors.VirtualMachine.RemoteCommandError(error_text)
+    if copy_to:
+      file_name = posixpath.basename(file_path)
+      remote_path = remote_path or file_name
+      self.RemoteCommand('mv %s %s; chmod 777 %s' %
+                         (file_name, remote_path, remote_path))
+
+  @vm_util.Retry(log_errors=False, poll_interval=1)
+  def PrepareVMEnvironment(self):
+    super(DebianBasedKubernetesVirtualMachine, self).PrepareVMEnvironment()
+    # Don't rely on SSH being installed in Kubernetes containers,
+    # so install it and restart the service so that it is ready to go.
+    # Although ssh is not required to connect to the container, MPI
+    # benchmarks require it.
+    self.InstallPackages('ssh')
+    self.RemoteCommand('sudo /etc/init.d/ssh restart', ignore_failure=True)
+    self.RemoteCommand('mkdir ~/.ssh')
+    with open(self.ssh_public_key) as f:
+      key = f.read()
+      self.RemoteCommand('echo "%s" >> ~/.ssh/authorized_keys' % key)
+
+    # Don't assume the relevant CLI is installed in the Kubernetes environment.
+    if FLAGS.container_cluster_cloud == 'GCP':
+      self.InstallGcloudCli()
+    elif FLAGS.container_cluster_cloud == 'AWS':
+      self.InstallAwsCli()
+    elif FLAGS.container_cluster_cloud == 'Azure':
+      self.InstallAzureCli()
+
+  def InstallAwsCli(self):
+    """Installs the AWS CLI; used for downloading preprovisioned data."""
+    self.Install('aws_credentials')
+    self.Install('awscli')
+
+  def InstallAzureCli(self):
+    """Installs the Azure CLI; used for downloading preprovisioned data."""
+    self.Install('azure_cli')
+    self.Install('azure_credentials')
+
+  # TODO(ferneyhough): Consider making this a package.
+  def InstallGcloudCli(self):
+    """Installs the Gcloud CLI; used for downloading preprovisioned data."""
+    self.InstallPackages('curl')
+    self.RemoteCommand('echo "deb http://packages.cloud.google.com/apt '
+                       'cloud-sdk-$(lsb_release -c -s) main" | sudo tee -a '
+                       '/etc/apt/sources.list.d/google-cloud-sdk.list')
+    self.RemoteCommand('curl https://packages.cloud.google.com/apt/doc/'
+                       'apt-key.gpg | sudo apt-key add -')
+    self.RemoteCommand('sudo apt-get update && sudo apt-get install '
+                       '-y google-cloud-sdk')
+
+  def DownloadPreprovisionedBenchmarkData(self, install_path, benchmark_name,
+                                          filename):
+    """Downloads a preprovisioned data file.
+
+    This function works by looking up the VirtualMachine class which matches
+    the cloud we are running on (defined by FLAGS.container_cluster_cloud).
+
+    Then we look for a module-level function defined in the same module as
+    the VirtualMachine class which generates a string used to download
+    preprovisioned data for the given cloud.
+
+    Note that this implementation is specific to debian os types.
+    Windows support will need to be handled in
+    WindowsBasedKubernetesVirtualMachine.
+
+    Args:
+      install_path: The install path on this VM.
+      benchmark_name: Name of the benchmark associated with this data file.
+      filename: The name of the file that was downloaded.
+
+    Raises:
+      NotImplementedError: if this method does not support the specified cloud.
+      AttributeError: if the VirtualMachine class does not implement
+        GenerateDownloadPreprovisionedBenchmarkDataCommand.
+    """
+    cloud = FLAGS.container_cluster_cloud
+    if cloud == 'GCP':
+      download_function = (gce_virtual_machine.
+                           GenerateDownloadPreprovisionedBenchmarkDataCommand)
+    elif cloud == 'AWS':
+      download_function = (aws_virtual_machine.
+                           GenerateDownloadPreprovisionedBenchmarkDataCommand)
+    elif cloud == 'Azure':
+      download_function = (azure_virtual_machine.
+                           GenerateDownloadPreprovisionedBenchmarkDataCommand)
+    else:
+      raise NotImplementedError(
+          'Cloud {0} does not support downloading preprovisioned '
+          'data on Kubernetes VMs.'.format(cloud))
+
+    self.RemoteCommand(
+        download_function(install_path, benchmark_name, filename))
+
+
+def _install_sudo_command():
+  """Return a bash command that installs sudo and runs tail indefinitely.
+
+  This is useful for some docker images that don't have sudo installed.
+
+  Returns:
+    a sequence of arguments that use bash to install sudo and never run
+    tail indefinitely.
+  """
+  # The canonical ubuntu images as well as the nvidia/cuda
+  # image do not have sudo installed so install it and configure
+  # the sudoers file such that the root user's environment is
+  # preserved when running as sudo. Then run tail indefinitely so that
+  # the container does not exit.
+  container_command = ' && '.join([
+      'apt-get update',
+      'apt-get install -y sudo',
+      'sed -i \'/env_reset/d\' /etc/sudoers',
+      'sed -i \'/secure_path/d\' /etc/sudoers',
+      'sudo ldconfig',
+      'tail -f /dev/null',
+  ])
+  return ['bash', '-c', container_command]
+
+
+class Ubuntu1404BasedKubernetesVirtualMachine(
+    DebianBasedKubernetesVirtualMachine, linux_virtual_machine.Ubuntu1404Mixin):
+  # All Ubuntu images below are from https://hub.docker.com/_/ubuntu/
+  # Note that they do not include all packages that are typically
+  # included with Ubuntu. For example, sudo is not installed.
+  # KubernetesVirtualMachine takes care of this by installing
+  # sudo in the container startup script.
+  DEFAULT_IMAGE = 'ubuntu:14.04'
+  CONTAINER_COMMAND = _install_sudo_command()
+
+
+class Ubuntu1604BasedKubernetesVirtualMachine(
+    DebianBasedKubernetesVirtualMachine, linux_virtual_machine.Ubuntu1604Mixin):
+  DEFAULT_IMAGE = 'ubuntu:16.04'
+  CONTAINER_COMMAND = _install_sudo_command()
+
+
+class Ubuntu1710BasedKubernetesVirtualMachine(
+    DebianBasedKubernetesVirtualMachine, linux_virtual_machine.Ubuntu1710Mixin):
+  DEFAULT_IMAGE = 'ubuntu:17.10'
+  CONTAINER_COMMAND = _install_sudo_command()
+
+
+class Ubuntu1604Cuda9BasedKubernetesVirtualMachine(
+    DebianBasedKubernetesVirtualMachine,
+    linux_virtual_machine.Ubuntu1604Cuda9Mixin):
+  # Image is from https://hub.docker.com/r/nvidia/cuda/
+  DEFAULT_IMAGE = 'nvidia/cuda:9.0-devel-ubuntu16.04'
+  CONTAINER_COMMAND = _install_sudo_command()

@@ -23,6 +23,7 @@ Homepage: http://www.netlib.org/benchmark/hpl/
 
 HPL requires a BLAS library (Basic Linear Algebra Subprograms)
 OpenBlas: http://www.openblas.net/
+Intel MKL: https://software.intel.com/en-us/mkl
 
 HPL also requires a MPI (Message Passing Interface) Library
 OpenMPI: http://www.open-mpi.org/
@@ -39,14 +40,13 @@ http://www.netlib.org/benchmark/hpl/faqs.html
 
 import logging
 import math
-import re
 
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import data
 from perfkitbenchmarker import flags
+from perfkitbenchmarker import hpc_util
 from perfkitbenchmarker import regex_util
 from perfkitbenchmarker import sample
-from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.linux_packages import hpcc
 
 FLAGS = flags.FLAGS
@@ -54,6 +54,17 @@ HPCCINF_FILE = 'hpccinf.txt'
 MACHINEFILE = 'machinefile'
 BLOCK_SIZE = 192
 STREAM_METRICS = ['Copy', 'Scale', 'Add', 'Triad']
+
+MKL_TGZ = 'l_mkl_2018.2.199.tgz'
+BENCHMARK_DATA = {
+    # Intel MKL package downloaded from:
+    # https://software.intel.com/en-us/mkl
+    # In order to get "l_mkl_2018.2.199.tgz", please choose the product
+    # "Intel Performance Libraries for Linux*", choose the version
+    # "2018 Update 2" and choose the download option "Intel
+    # Math Kernel Library(Intel Mkl)".
+    MKL_TGZ: 'fd31b656a8eb859c89495b9cc41230b4',
+}
 
 BENCHMARK_NAME = 'hpcc'
 BENCHMARK_CONFIG = """
@@ -69,35 +80,28 @@ flags.DEFINE_integer('memory_size_mb',
                      None,
                      'The amount of memory in MB on each machine to use. By '
                      'default it will use the entire system\'s memory.')
+flags.DEFINE_string('hpcc_binary', None,
+                    'The path of prebuilt hpcc binary to use. If not provided, '
+                    'this benchmark built its own using OpenBLAS.')
+flags.DEFINE_list('hpcc_mpi_env', [],
+                  'Comma separated list containing environment variables '
+                  'to use with mpirun command. e.g. '
+                  'MKL_DEBUG_CPU_TYPE=7,MKL_ENABLE_INSTRUCTIONS=AVX512')
 
 
 def GetConfig(user_config):
   return configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
 
 
-def CheckPrerequisites():
+def CheckPrerequisites(_):
   """Verifies that the required resources are present.
 
   Raises:
     perfkitbenchmarker.data.ResourceNotFound: On missing resource.
   """
   data.ResourcePath(HPCCINF_FILE)
-
-
-def CreateMachineFile(vms):
-  """Create a file with the IP of each machine in the cluster on its own line.
-
-  Args:
-    vms: The list of vms which will be in the cluster.
-  """
-  with vm_util.NamedTemporaryFile() as machine_file:
-    master_vm = vms[0]
-    machine_file.write('localhost slots=%d\n' % master_vm.num_cpus)
-    for vm in vms[1:]:
-      machine_file.write('%s slots=%d\n' % (vm.internal_ip,
-                                            vm.num_cpus))
-    machine_file.close()
-    master_vm.PushFile(machine_file.name, MACHINEFILE)
+  if FLAGS['hpcc_binary'].present:
+    data.ResourcePath(FLAGS.hpcc_binary)
 
 
 def CreateHpccinf(vm, benchmark_spec):
@@ -106,9 +110,7 @@ def CreateHpccinf(vm, benchmark_spec):
   if FLAGS.memory_size_mb:
     total_memory = FLAGS.memory_size_mb * 1024 * 1024 * num_vms
   else:
-    stdout, _ = vm.RemoteCommand("free | sed -n 3p | awk {'print $4'}")
-    available_memory = int(stdout)
-    total_memory = available_memory * 1024 * num_vms
+    total_memory = vm.total_free_memory_kb * 1024 * num_vms
   total_cpus = vm.num_cpus * num_vms
   block_size = BLOCK_SIZE
 
@@ -143,6 +145,22 @@ def PrepareHpcc(vm):
   vm.Install('hpcc')
 
 
+def PrepareBinaries(vms):
+  """Prepare binaries on all vms."""
+  master_vm = vms[0]
+  if FLAGS.hpcc_binary:
+    master_vm.PushFile(
+        data.ResourcePath(FLAGS.hpcc_binary), './hpcc')
+  else:
+    master_vm.RemoteCommand('cp %s/hpcc hpcc' % hpcc.HPCC_DIR)
+
+  for vm in vms[1:]:
+    vm.Install('fortran')
+    master_vm.MoveFile(vm, 'hpcc', 'hpcc')
+    master_vm.MoveFile(vm, '/usr/bin/orted', 'orted')
+    vm.RemoteCommand('sudo mv orted /usr/bin/orted')
+
+
 def Prepare(benchmark_spec):
   """Install HPCC on the target vms.
 
@@ -155,14 +173,19 @@ def Prepare(benchmark_spec):
 
   PrepareHpcc(master_vm)
   CreateHpccinf(master_vm, benchmark_spec)
-  CreateMachineFile(vms)
-  master_vm.RemoteCommand('cp %s/hpcc hpcc' % hpcc.HPCC_DIR)
+  hpc_util.CreateMachineFile(vms, remote_path=MACHINEFILE)
+  PrepareBinaries(vms)
+  master_vm.AuthenticateVm()
 
-  for vm in vms[1:]:
-    vm.Install('fortran')
-    master_vm.MoveFile(vm, 'hpcc', 'hpcc')
-    master_vm.MoveFile(vm, '/usr/bin/orted', 'orted')
-    vm.RemoteCommand('sudo mv orted /usr/bin/orted')
+
+def UpdateMetadata(metadata):
+  """Update metadata with hpcc-related flag values."""
+  metadata['memory_size_mb'] = FLAGS.memory_size_mb
+  if FLAGS['hpcc_binary'].present:
+    metadata['override_binary'] = FLAGS.hpcc_binary
+  if FLAGS['hpcc_mpi_env'].present:
+    metadata['mpi_env'] = FLAGS.hpcc_mpi_env
+  metadata['hpcc_math_library'] = FLAGS.hpcc_math_library
 
 
 def ParseOutput(hpcc_output, benchmark_spec):
@@ -177,25 +200,33 @@ def ParseOutput(hpcc_output, benchmark_spec):
     A list of samples to be published (in the same format as Run() returns).
   """
   results = []
-
   metadata = dict()
-  match = re.search('HPLMaxProcs=([0-9]*)', hpcc_output)
-  metadata['num_cpus'] = match.group(1)
   metadata['num_machines'] = len(benchmark_spec.vms)
-  metadata['memory_size_mb'] = FLAGS.memory_size_mb
+  UpdateMetadata(metadata)
+
+  # Parse all metrics from metric=value lines in the HPCC output.
+  metric_values = regex_util.ExtractAllFloatMetrics(
+      hpcc_output)
+  for metric, value in metric_values.iteritems():
+    results.append(sample.Sample(metric, value, '', metadata))
+
+  # Parse some metrics separately and add units. Although these metrics are
+  # parsed above and added to results, this handling is left so that existing
+  # uses of these metric names will continue to work.
   value = regex_util.ExtractFloat('HPL_Tflops=([0-9]*\\.[0-9]*)', hpcc_output)
   results.append(sample.Sample('HPL Throughput', value, 'Tflops', metadata))
 
   value = regex_util.ExtractFloat('SingleRandomAccess_GUPs=([0-9]*\\.[0-9]*)',
                                   hpcc_output)
-  results.append(sample.Sample('Random Access Throughput', value,
-                               'GigaUpdates/sec'))
+  results.append(
+      sample.Sample('Random Access Throughput', value, 'GigaUpdates/sec',
+                    metadata))
 
   for metric in STREAM_METRICS:
     regex = 'SingleSTREAM_%s=([0-9]*\\.[0-9]*)' % metric
     value = regex_util.ExtractFloat(regex, hpcc_output)
-    results.append(sample.Sample('STREAM %s Throughput' % metric, value,
-                                 'GB/s'))
+    results.append(
+        sample.Sample('STREAM %s Throughput' % metric, value, 'GB/s', metadata))
 
   value = regex_util.ExtractFloat(r'PTRANS_GBs=([0-9]*\.[0-9]*)', hpcc_output)
   results.append(sample.Sample('PTRANS Throughput', value, 'GB/s', metadata))
@@ -214,11 +245,15 @@ def Run(benchmark_spec):
   """
   vms = benchmark_spec.vms
   master_vm = vms[0]
+  # backup existing HPCC output, if any
+  master_vm.RemoteCommand(('if [ -f hpccoutf.txt ]; then '
+                           'mv hpccoutf.txt hpccoutf-$(date +%s).txt; '
+                           'fi'))
   num_processes = len(vms) * master_vm.num_cpus
-
+  mpi_env = ' '.join(['-x %s' % v for v in FLAGS.hpcc_mpi_env])
   mpi_cmd = ('mpirun -np %s -machinefile %s --mca orte_rsh_agent '
-             '"ssh -o StrictHostKeyChecking=no" ./hpcc' %
-             (num_processes, MACHINEFILE))
+             '"ssh -o StrictHostKeyChecking=no" %s ./hpcc' %
+             (num_processes, MACHINEFILE, mpi_env))
   master_vm.RobustRemoteCommand(mpi_cmd)
   logging.info('HPCC Results:')
   stdout, _ = master_vm.RemoteCommand('cat hpccoutf.txt', should_log=True)

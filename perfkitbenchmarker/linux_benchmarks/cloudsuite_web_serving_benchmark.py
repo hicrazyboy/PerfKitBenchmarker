@@ -25,6 +25,9 @@ from perfkitbenchmarker import sample
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.linux_packages import docker
 
+flags.DEFINE_integer('cloudsuite_web_serving_pm_max_children', 150,
+                     'The maximum number php-fpm pm children.', lower_bound=8)
+
 flags.DEFINE_integer('cloudsuite_web_serving_load_scale', 100,
                      'The maximum number of concurrent users '
                      'that can be simulated.', lower_bound=2)
@@ -52,7 +55,7 @@ def GetConfig(user_config):
   return configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
 
 
-def CheckPrerequisites():
+def CheckPrerequisites(benchmark_config):
   """Verifies that the required resources are present.
   Raises:
     perfkitbenchmarker.data.ResourceNotFound: On missing resource.
@@ -86,22 +89,24 @@ def Prepare(benchmark_spec):
 
   def PrepareFrontend(vm):
     PrepareCommon(vm)
-    vm.RemoteCommand('sudo docker pull cloudsuite/web-serving:web_server')
-    vm.RemoteCommand('sudo docker pull cloudsuite/web-serving:memcached_server')
+    vm.Install('cloudsuite/web-serving:web_server')
+    vm.Install('cloudsuite/web-serving:memcached_server')
     vm.RemoteCommand('sudo docker run -dt --net host --name web_server '
-                     'cloudsuite/web-serving:web_server /etc/bootstrap.sh')
+                     'cloudsuite/web-serving:web_server '
+                     '/etc/bootstrap.sh mysql_server memcache_server %s' %
+                     (FLAGS.cloudsuite_web_serving_pm_max_children))
     vm.RemoteCommand('sudo docker run -dt --net host --name memcache_server '
                      'cloudsuite/web-serving:memcached_server')
 
   def PrepareBackend(vm):
     PrepareCommon(vm)
-    vm.RemoteCommand('sudo docker pull cloudsuite/web-serving:db_server')
+    vm.Install('cloudsuite/web-serving:db_server')
     vm.RemoteCommand('sudo docker run -dt --net host --name mysql_server '
-                     'cloudsuite/web-serving:db_server')
+                     'cloudsuite/web-serving:db_server web_server')
 
   def PrepareClient(vm):
     PrepareCommon(vm)
-    vm.RemoteCommand('sudo docker pull cloudsuite/web-serving:faban_client')
+    vm.Install('cloudsuite/web-serving:faban_client')
 
   target_arg_tuples = [(PrepareFrontend, [frontend], {}),
                        (PrepareBackend, [backend], {}),
@@ -162,17 +167,13 @@ def Cleanup(benchmark_spec):
     vm.RemoteCommand('sudo docker rm memcache_server')
     vm.RemoteCommand('sudo docker stop web_server')
     vm.RemoteCommand('sudo docker rm web_server')
-    vm.RemoteCommand('sudo docker rmi cloudsuite/web-serving:memcached_server')
-    vm.RemoteCommand('sudo docker rmi cloudsuite/web-serving:web_server')
 
   def CleanupBackend(vm):
     vm.RemoteCommand('sudo docker stop mysql_server')
     vm.RemoteCommand('sudo docker rm mysql_server')
-    vm.RemoteCommand('sudo docker rmi cloudsuite/web-serving:db_server')
 
   def CleanupClient(vm):
     vm.RemoteCommand('sudo docker rm faban_client')
-    vm.RemoteCommand('sudo docker rmi cloudsuite/web-serving:faban_client')
 
   target_arg_tuples = [(CleanupFrontend, [frontend], {}),
                        (CleanupBackend, [backend], {}),

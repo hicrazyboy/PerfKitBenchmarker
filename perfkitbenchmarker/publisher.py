@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 # Copyright 2014 PerfKitBenchmarker Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,21 +17,26 @@
 """Classes to collect and publish performance samples to various sinks."""
 
 import abc
+import collections
+import copy
 import csv
+import fcntl
+import httplib
 import io
 import itertools
 import json
 import logging
+import math
 import operator
 import pprint
 import sys
 import time
+import urllib
 import uuid
 
-from perfkitbenchmarker import disk
-from perfkitbenchmarker import events
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import flag_util
+from perfkitbenchmarker import log_util
 from perfkitbenchmarker import version
 from perfkitbenchmarker import vm_util
 
@@ -47,11 +54,22 @@ flags.DEFINE_boolean(
     'default is False. Official test results are treated and queried '
     'differently from non-official test results.')
 
+flags.DEFINE_boolean(
+    'hostname_metadata',
+    False,
+    'A boolean indicating whether to publish VM hostnames as part of sample '
+    'metadata.')
+
 flags.DEFINE_string(
     'json_path',
     None,
     'A path to write newline-delimited JSON results '
     'Default: write to a run-specific temporary directory')
+flags.DEFINE_enum(
+    'json_write_mode',
+    'wb',
+    ['wb', 'ab'],
+    'Open mode for file specified by --json_path. Default: overwrite file')
 flags.DEFINE_boolean(
     'collapse_labels',
     True,
@@ -83,30 +101,53 @@ flags.DEFINE_string(
     None,
     'GCS bucket to upload records to. Bucket must exist.')
 
-flags.DEFINE_multistring(
+flags.DEFINE_string(
+    'es_uri', None,
+    'The Elasticsearch address and port. e.g. http://localhost:9200')
+
+flags.DEFINE_string(
+    'es_index', 'perfkit', 'Elasticsearch index name to store documents')
+
+flags.DEFINE_string('es_type', 'result', 'Elasticsearch document type')
+
+flags.DEFINE_multi_string(
     'metadata',
     [],
     'A colon separated key-value pair that will be added to the labels field '
     'of all samples as metadata. Multiple key-value pairs may be specified '
-    'by separating each pair by commas. This option can be repeated multiple '
-    'times.')
+    'by separating each pair by commas.')
+
+flags.DEFINE_string(
+    'influx_uri', None,
+    'The Influx DB address and port. Expects the format hostname:port'
+    'If port is not passed in it assumes port 80. e.g. localhost:8086')
+
+flags.DEFINE_string(
+    'influx_db_name', 'perfkit',
+    'Name of Influx DB database that you wish to publish to or create')
 
 DEFAULT_JSON_OUTPUT_NAME = 'perfkitbenchmarker_results.json'
 DEFAULT_CREDENTIALS_JSON = 'credentials.json'
 GCS_OBJECT_NAME_LENGTH = 20
 
+# A list of SamplePublishers that can be extended to add support for publishing
+# types beyond those in this module. The classes should not require any
+# arguments to their __init__ methods. The SampleCollector will unconditionally
+# call PublishSamples using Publishers added via this method.
+EXTERNAL_PUBLISHERS = []
+
 
 def GetLabelsFromDict(metadata):
-  """Converts a metadata dictionary to a string of labels.
+  """Converts a metadata dictionary to a string of labels sorted by key.
 
   Args:
     metadata: a dictionary of string key value pairs.
 
   Returns:
-    A string of labels in the format that Perfkit uses.
+    A string of labels, sorted by key, in the format that Perfkit uses.
   """
   labels = []
-  for k, v in metadata.iteritems():
+  for k, v in sorted(metadata.iteritems()):
     labels.append('|%s:%s|' % (k, v))
   return ','.join(labels)
 
@@ -138,6 +179,31 @@ class DefaultMetadataProvider(MetadataProvider):
   def AddMetadata(self, metadata, benchmark_spec):
     metadata = metadata.copy()
     metadata['perfkitbenchmarker_version'] = version.VERSION
+    if FLAGS.simulate_maintenance:
+      metadata['simulate_maintenance'] = True
+    if FLAGS.hostname_metadata:
+      metadata['hostnames'] = ','.join([vm.hostname
+                                        for vm in benchmark_spec.vms])
+    if benchmark_spec.container_cluster:
+      cluster = benchmark_spec.container_cluster
+      for k, v in cluster.GetResourceMetadata().iteritems():
+        metadata['container_cluster_' + k] = v
+
+    if benchmark_spec.managed_relational_db:
+      managed_db = benchmark_spec.managed_relational_db
+      for k, v in managed_db.GetResourceMetadata().iteritems():
+        metadata['managed_relational_db_' + k] = v
+
+    if benchmark_spec.cloud_tpu:
+      cloud_tpu = benchmark_spec.cloud_tpu
+      for k, v in cloud_tpu.GetResourceMetadata().iteritems():
+        metadata['cloud_tpu_' + k] = v
+
+    if benchmark_spec.cloud_redis:
+      cloud_redis = benchmark_spec.cloud_redis
+      for k, v in cloud_redis.GetResourceMetadata().iteritems():
+        metadata['cloud_redis_' + k] = v
+
     for name, vms in benchmark_spec.vm_groups.iteritems():
       if len(vms) == 0:
         continue
@@ -145,37 +211,22 @@ class DefaultMetadataProvider(MetadataProvider):
       # machine type, and image.
       vm = vms[-1]
       name_prefix = '' if name == 'default' else name + '_'
-      metadata[name_prefix + 'cloud'] = vm.CLOUD
-      metadata[name_prefix + 'zone'] = vm.zone
-      metadata[name_prefix + 'image'] = vm.image
-      for k, v in vm.GetMachineTypeDict().iteritems():
+      for k, v in vm.GetResourceMetadata().iteritems():
         metadata[name_prefix + k] = v
       metadata[name_prefix + 'vm_count'] = len(vms)
+      for k, v in vm.GetOSResourceMetadata().iteritems():
+        metadata[name_prefix + k] = v
 
       if vm.scratch_disks:
         data_disk = vm.scratch_disks[0]
-        disk_type = data_disk.disk_type
-        disk_size = data_disk.disk_size
-        num_stripes = data_disk.num_striped_disks
-        # Legacy metadata keys
-        metadata[name_prefix + 'scratch_disk_type'] = disk_type
-        metadata[name_prefix + 'scratch_disk_size'] = disk_size
-        metadata[name_prefix + 'num_striped_disks'] = (
-            data_disk.num_striped_disks)
-        if getattr(data_disk, 'iops', None) is not None:
-          metadata[name_prefix + 'scratch_disk_iops'] = data_disk.iops
-          metadata[name_prefix + 'aws_provisioned_iops'] = data_disk.iops
-        # Modern metadata keys
-        metadata[name_prefix + 'data_disk_0_type'] = disk_type
-        metadata[name_prefix + 'data_disk_0_size'] = (
-            disk_size * num_stripes if disk_size else disk_size)
-        metadata[name_prefix + 'data_disk_0_num_stripes'] = num_stripes
-        if getattr(data_disk, 'metadata', None) is not None:
-          if disk.LEGACY_DISK_TYPE in data_disk.metadata:
-            metadata[name_prefix + 'scratch_disk_type'] = (
-                data_disk.metadata[disk.LEGACY_DISK_TYPE])
-          for key, value in data_disk.metadata.iteritems():
-            metadata[name_prefix + 'data_disk_0_' + key] = value
+        metadata[name_prefix + 'data_disk_count'] = len(vm.scratch_disks)
+        for key, value in data_disk.GetResourceMetadata().iteritems():
+          metadata[name_prefix + 'data_disk_0_%s' % (key, )] = value
+
+    if FLAGS.set_files:
+      metadata['set_files'] = ','.join(FLAGS.set_files)
+    if FLAGS.sysctl:
+      metadata['sysctl'] = ','.join(FLAGS.sysctl)
 
     # Flatten all user metadata into a single list (since each string in the
     # FLAGS.metadata can actually be several key-value pairs) and then iterate
@@ -289,7 +340,7 @@ class PrettyPrintStreamPublisher(SamplePublisher):
 
     for sample in samples:
       for k, v in sample['metadata'].iteritems():
-        if len(unique_values.setdefault(k, set())) < 2:
+        if len(unique_values.setdefault(k, set())) < 2 and v.__hash__:
           unique_values[k].add(v)
 
     # Find keys which are not present in all samples
@@ -416,6 +467,7 @@ class NewlineDelimitedJSONPublisher(SamplePublisher):
     logging.info('Publishing %d samples to %s', len(samples),
                  self.file_path)
     with open(self.file_path, self.mode) as fp:
+      fcntl.flock(fp, fcntl.LOCK_EX)
       for sample in samples:
         sample = sample.copy()
         if self.collapse_labels:
@@ -479,6 +531,7 @@ class BigQueryPublisher(SamplePublisher):
                          '--service_account_private_key_file=' +
                          self.service_account_private_key_file])
       load_cmd.extend(['load',
+                       '--autodetect',
                        '--source_format=NEWLINE_DELIMITED_JSON',
                        self.bigquery_table,
                        tf.name])
@@ -526,6 +579,236 @@ class CloudStoragePublisher(SamplePublisher):
       vm_util.IssueRetryableCommand(copy_cmd)
 
 
+class ElasticsearchPublisher(SamplePublisher):
+  """Publish samples to an Elasticsearch server. Index and document type
+  will be created if they do not exist.
+
+  Attributes:
+    es_uri: String. e.g. "http://localhost:9200"
+    es_index: String. Default "perfkit"
+    es_type: String. Default "result"
+  """
+  def __init__(self, es_uri=None, es_index=None, es_type=None):
+    self.es_uri = es_uri
+    self.es_index = es_index.lower()
+    self.es_type = es_type
+    self.mapping_5_plus = {
+        "mappings": {
+            "result": {
+                "numeric_detection": True,
+                "properties": {
+                    "timestamp": {
+                        "type": "date",
+                        "format": "yyyy-MM-dd HH:mm:ss.SSSSSS"
+                    },
+                    "value": {
+                        "type": "double"
+                    }
+                },
+                "dynamic_templates": [{
+                    "strings": {
+                        "match_mapping_type": "string",
+                        "mapping": {
+                            "type": "text",
+                            "fields": {
+                                "raw": {
+                                    "type": "keyword",
+                                    "ignore_above": 256
+                                }
+                            }
+                        }
+                    }
+                }]
+            }
+        }
+    }
+
+    self.mapping_before_5 = {
+        "mappings": {
+            "result": {
+                "numeric_detection": True,
+                "properties": {
+                    "timestamp": {
+                        "type": "date",
+                        "format": "yyyy-MM-dd HH:mm:ss.SSSSSS"
+                    },
+                    "value": {
+                        "type": "double"
+                    }
+                },
+                "dynamic_templates": [{
+                    "strings": {
+                        "match_mapping_type": "string",
+                        "mapping": {
+                            "type": "string",
+                            "fields": {
+                                "raw": {
+                                    "type": "string",
+                                    "index": "not_analyzed"
+                                }
+                            }
+                        }
+                    }
+                }]
+            }
+        }
+    }
+
+  def PublishSamples(self, samples):
+    """Publish samples to Elasticsearch service"""
+    try:
+      from elasticsearch import Elasticsearch
+    except ImportError:
+      raise ImportError('The "elasticsearch" package is required to use '
+                        'the Elasticsearch publisher. Please make sure it '
+                        'is installed.')
+
+    es = Elasticsearch([self.es_uri])
+    if not es.indices.exists(index=self.es_index):
+      # choose whether to use old or new mapings based on
+      # the version of elasticsearch that is being used
+      if int(es.info()['version']['number'].split('.')[0]) >= 5:
+        es.indices.create(index=self.es_index, body=self.mapping_5_plus)
+        logging.info('Create index %s and default mappings for'
+                     ' elasticsearch version >= 5.0.0',
+                     self.es_index)
+      else:
+        es.indices.create(index=self.es_index, body=self.mapping_before_5)
+        logging.info('Create index %s and default mappings for'
+                     ' elasticsearch version < 5.0.0',
+                     self.es_index)
+    for s in samples:
+      sample = copy.deepcopy(s)
+      # Make timestamp understandable by ES and human.
+      sample['timestamp'] = self._FormatTimestampForElasticsearch(
+          sample['timestamp']
+      )
+      # Keys cannot have dots for ES
+      sample = self._deDotKeys(sample)
+      # Add sample to the "perfkit index" of "result type" and using sample_uri
+      # as each ES's document's unique _id
+      es.create(index=self.es_index, doc_type=self.es_type,
+                id=sample['sample_uri'], body=json.dumps(sample))
+
+  def _FormatTimestampForElasticsearch(self, epoch_us):
+    """Convert the floating epoch timestamp in micro seconds epoch_us to
+    yyyy-MM-dd HH:mm:ss.SSSSSS in string
+    """
+    ts = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(epoch_us))
+    num_dec = ("%.6f" % (epoch_us - math.floor(epoch_us))).split('.')[1]
+    new_ts = '%s.%s' % (ts, num_dec)
+    return new_ts
+
+  def _deDotKeys(self, res):
+    """Recursively replace dot with underscore in all keys in a dictionary."""
+    for key, value in res.items():
+      if isinstance(value, dict):
+        self._deDotKeys(value)
+      new_key = key.replace('.', '_')
+      if new_key != key:
+        res[new_key] = res.pop(key)
+    return res
+
+
+class InfluxDBPublisher(SamplePublisher):
+  """Publisher writes samples to InfluxDB.
+
+  Attributes:
+    influx_uri: Takes in type string. Consists of the Influx DB address and
+      port.Expects the format hostname:port
+    influx_db_name: Takes in tupe string.
+      Consists of the name of Influx DB database that you wish to publish to or
+      create.
+  """
+
+  def __init__(self, influx_uri=None, influx_db_name=None):
+    # set to default above in flags unless changed
+    self.influx_uri = influx_uri
+    self.influx_db_name = influx_db_name
+
+  def PublishSamples(self, samples):
+    formated_samples = []
+    for sample in samples:
+      formated_samples.append(self._ConstructSample(sample))
+    self._Publish(formated_samples)
+
+  def _Publish(self, formated_samples):
+    try:
+      self._CreateDB()
+      body = '\n'.join(formated_samples)
+      self._WriteData(body)
+    except (IOError, httplib.HTTPException) as http_exception:
+      logging.error('Error connecting to the database:  %s', http_exception)
+
+  def _ConstructSample(self, sample):
+    sample['product_name'] = FLAGS.product_name
+    timestamp = str(int((10 ** 9) * sample['timestamp']))
+    measurement = 'perfkitbenchmarker'
+
+    tag_set_metadata = ''
+    if 'metadata' in sample:
+      if sample['metadata']:
+        tag_set_metadata = ','.join(self._FormatToKeyValue(sample['metadata']))
+    tag_keys = ('test', 'official', 'owner', 'run_uri', 'sample_uri',
+                'metric', 'unit', 'product_name')
+    ordered_tags = collections.OrderedDict([(k, sample[k]) for k in tag_keys])
+    tag_set = ','.join(self._FormatToKeyValue(ordered_tags))
+    if tag_set_metadata:
+      tag_set += ',' + tag_set_metadata
+
+    field_set = '%s=%s' % ('value', sample['value'])
+
+    sample_constructed_body = '%s,%s %s %s' % (measurement, tag_set,
+                                               field_set, timestamp)
+    return sample_constructed_body
+
+  def _FormatToKeyValue(self, sample):
+    key_value_pairs = []
+    for k, v in sample.iteritems():
+      if v == '':
+        v = '\\"\\"'
+      v = str(v)
+      v = v.replace(',', '\,')
+      v = v.replace(' ', '\ ')
+      key_value_pairs.append('%s=%s' % (k, v))
+    return key_value_pairs
+
+  def _CreateDB(self):
+    """This method is idempotent. If the DB already exists it will simply
+    return a 200 code without re-creating it.
+    """
+    successful_http_request_codes = [200, 202, 204]
+    header = {'Content-type': 'application/x-www-form-urlencoded',
+              'Accept': 'text/plain'}
+    params = urllib.urlencode({'q': 'CREATE DATABASE ' + self.influx_db_name})
+    conn = httplib.HTTPConnection(self.influx_uri)
+    conn.request('POST', '/query?' + params, headers=header)
+    response = conn.getresponse()
+    conn.close()
+    if response.status in successful_http_request_codes:
+      logging.debug('Success! %s DB Created', self.influx_db_name)
+    else:
+      logging.error('%d Request could not be completed due to: %s',
+                    response.status, response.reason)
+      raise httplib.HTTPException
+
+  def _WriteData(self, data):
+    successful_http_request_codes = [200, 202, 204]
+    params = data
+    header = {"Content-type": "application/octet-stream"}
+    conn = httplib.HTTPConnection(self.influx_uri)
+    conn.request('POST', '/write?' + 'db=' + self.influx_db_name, params,
+                 headers=header)
+    response = conn.getresponse()
+    conn.close()
+    if response.status in successful_http_request_codes:
+      logging.debug('Writing samples to publisher: writing samples.')
+    else:
+      logging.error('%d Request could not be completed due to: %s %s',
+                    response.status, response.reason, data)
+      raise httplib.HTTPException
+
+
 class SampleCollector(object):
   """A performance sample collector.
 
@@ -536,14 +819,16 @@ class SampleCollector(object):
     samples: A list of Sample objects.
     metadata_providers: A list of MetadataProvider objects. Metadata providers
       to use.  Defaults to DEFAULT_METADATA_PROVIDERS.
-    publishers: A list of SamplePublisher objects. If not specified, defaults to
-      a LogPublisher, PrettyPrintStreamPublisher, NewlineDelimitedJSONPublisher,
-      a BigQueryPublisher if FLAGS.bigquery_table is specified, and a
-      CloudStoragePublisher if FLAGS.cloud_storage_bucket is specified. See
-      SampleCollector._DefaultPublishers.
+    publishers: A list of SamplePublisher objects to publish to.
+    publishers_from_flags: If True, construct publishers based on FLAGS and add
+      those to the publishers list.
+    add_default_publishers: If True, add a LogPublisher,
+      PrettyPrintStreamPublisher, and NewlineDelimitedJSONPublisher targeting
+      the run directory to the publishers list.
     run_uri: A unique tag for the run.
   """
-  def __init__(self, metadata_providers=None, publishers=None):
+  def __init__(self, metadata_providers=None, publishers=None,
+               publishers_from_flags=True, add_default_publishers=True):
     self.samples = []
 
     if metadata_providers is not None:
@@ -551,10 +836,13 @@ class SampleCollector(object):
     else:
       self.metadata_providers = DEFAULT_METADATA_PROVIDERS
 
-    if publishers is not None:
-      self.publishers = publishers
-    else:
-      self.publishers = SampleCollector._DefaultPublishers()
+    self.publishers = publishers[:] if publishers else []
+    for publisher_class in EXTERNAL_PUBLISHERS:
+      self.publishers.append(publisher_class())
+    if publishers_from_flags:
+      self.publishers.extend(SampleCollector._PublishersFromFlags())
+    if add_default_publishers:
+      self.publishers.extend(SampleCollector._DefaultPublishers())
 
     logging.debug('Using publishers: {0}'.format(self.publishers))
 
@@ -562,10 +850,27 @@ class SampleCollector(object):
   def _DefaultPublishers(cls):
     """Gets a list of default publishers."""
     publishers = [LogPublisher(), PrettyPrintStreamPublisher()]
+
+    # Publish to the default JSON path even if we will also publish to a
+    # different path due to flags.
     default_json_path = vm_util.PrependTempDir(DEFAULT_JSON_OUTPUT_NAME)
     publishers.append(NewlineDelimitedJSONPublisher(
-        FLAGS.json_path or default_json_path,
+        default_json_path,
+        mode=FLAGS.json_write_mode,
         collapse_labels=FLAGS.collapse_labels))
+
+    return publishers
+
+  @classmethod
+  def _PublishersFromFlags(cls):
+    publishers = []
+
+    if FLAGS.json_path:
+      publishers.append(NewlineDelimitedJSONPublisher(
+          FLAGS.json_path,
+          mode=FLAGS.json_write_mode,
+          collapse_labels=FLAGS.collapse_labels))
+
     if FLAGS.bigquery_table:
       publishers.append(BigQueryPublisher(
           FLAGS.bigquery_table,
@@ -579,6 +884,14 @@ class SampleCollector(object):
                                               gsutil_path=FLAGS.gsutil_path))
     if FLAGS.csv_path:
       publishers.append(CSVPublisher(FLAGS.csv_path))
+
+    if FLAGS.es_uri:
+      publishers.append(ElasticsearchPublisher(es_uri=FLAGS.es_uri,
+                                               es_index=FLAGS.es_index,
+                                               es_type=FLAGS.es_type))
+    if FLAGS.influx_uri:
+      publishers.append(InfluxDBPublisher(influx_uri=FLAGS.influx_uri,
+                                          influx_db_name=FLAGS.influx_db_name))
 
     return publishers
 
@@ -604,11 +917,56 @@ class SampleCollector(object):
       sample['owner'] = FLAGS.owner
       sample['run_uri'] = benchmark_spec.uuid
       sample['sample_uri'] = str(uuid.uuid4())
-      events.sample_created.send(benchmark_spec=benchmark_spec,
-                                 sample=sample)
       self.samples.append(sample)
 
   def PublishSamples(self):
     """Publish samples via all registered publishers."""
+    if not self.samples:
+      logging.warn('No samples to publish.')
+      return
     for publisher in self.publishers:
       publisher.PublishSamples(self.samples)
+    self.samples = []
+
+
+def RepublishJSONSamples(path):
+  """Read samples from a JSON file and re-export them.
+
+  Args:
+    path: the path to the JSON file.
+  """
+
+  with open(path, 'r') as file:
+    samples = [json.loads(s) for s in file if s]
+  for sample in samples:
+    # Chop '|' at the beginning and end of labels and split labels by '|,|'
+    fields = sample.pop('labels')[1:-1].split('|,|')
+    # Turn the fields into [[key, value], ...]
+    key_values = [field.split(':', 1) for field in fields]
+    sample['metadata'] = {k: v for k, v in key_values}
+
+  # We can't use a SampleCollector because SampleCollector.AddSamples depends on
+  # having a benchmark and a benchmark_spec.
+  publishers = SampleCollector._PublishersFromFlags()
+  for publisher in publishers:
+    publisher.PublishSamples(samples)
+
+
+if __name__ == '__main__':
+  log_util.ConfigureBasicLogging()
+
+  try:
+    argv = FLAGS(sys.argv)
+  except flags.Error as e:
+    logging.error(e)
+    logging.info('Flag error. Usage: publisher.py <flags> path-to-json-file')
+    sys.exit(1)
+
+  if len(argv) != 2:
+    logging.info('Argument number error. Usage: publisher.py <flags> '
+                 'path-to-json-file')
+    sys.exit(1)
+
+  json_path = argv[1]
+
+  RepublishJSONSamples(json_path)

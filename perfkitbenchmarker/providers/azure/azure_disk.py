@@ -22,41 +22,36 @@ information about azure disks.
 """
 
 import json
-import logging
 import threading
 
 from perfkitbenchmarker import disk
+from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import vm_util
+from perfkitbenchmarker.providers import azure
+from perfkitbenchmarker.providers.azure import azure_network
 from perfkitbenchmarker.providers.azure import flags as azure_flags
-
-AZURE_PATH = 'azure'
 
 FLAGS = flags.FLAGS
 
 DRIVE_START_LETTER = 'c'
 
-PREMIUM_STORAGE = 'premium-storage'
-STANDARD_DISK = 'standard-disk'
+PREMIUM_STORAGE = 'Premium_LRS'
+STANDARD_DISK = 'Standard_LRS'
 
 DISK_TYPE = {disk.STANDARD: STANDARD_DISK,
              disk.REMOTE_SSD: PREMIUM_STORAGE}
 
+HOST_CACHING = 'host_caching'
+
 AZURE = 'Azure'
 disk.RegisterDiskTypeMap(AZURE, DISK_TYPE)
-
-PREMIUM_STORAGE_METADATA = {
-    disk.MEDIA: disk.SSD,
-    disk.REPLICATION: disk.ZONE,
-    disk.LEGACY_DISK_TYPE: disk.REMOTE_SSD
-}
 
 AZURE_REPLICATION_MAP = {
     azure_flags.LRS: disk.ZONE,
     azure_flags.ZRS: disk.REGION,
-    # Deliberately omitting PLRS, because that is handled by
-    # PREMIUM_STORAGE_METADATA, and (RA)GRS, because those are
-    # asynchronously replicated.
+    # Deliberately omitting PLRS, because that is set explicty in __init__,
+    # and (RA)GRS, because those are asynchronously replicated.
 }
 
 LOCAL_SSD_PREFIXES = {
@@ -76,101 +71,76 @@ class AzureDisk(disk.BaseDisk):
   """Object representing an Azure Disk."""
 
   _lock = threading.Lock()
-  num_disks = {}
 
-  def __init__(self, disk_spec, vm_name, machine_type):
+  def __init__(self, disk_spec, vm_name, machine_type,
+               storage_account, lun, is_image=False):
     super(AzureDisk, self).__init__(disk_spec)
     self.host_caching = FLAGS.azure_host_caching
-    self.name = None
+    self.name = vm_name + str(lun)
     self.vm_name = vm_name
-    self.lun = None
+    self.resource_group = azure_network.GetResourceGroup()
+    self.storage_account = storage_account
+    # lun is Azure's abbreviation for "logical unit number"
+    self.lun = lun
+    self.is_image = is_image
+    self._deleted = False
 
     if self.disk_type == PREMIUM_STORAGE:
-      self.metadata = PREMIUM_STORAGE_METADATA
+      self.metadata.update({
+          disk.MEDIA: disk.SSD,
+          disk.REPLICATION: disk.ZONE,
+          HOST_CACHING: self.host_caching,
+      })
     elif self.disk_type == STANDARD_DISK:
-      self.metadata = {
+      self.metadata.update({
           disk.MEDIA: disk.HDD,
           disk.REPLICATION: AZURE_REPLICATION_MAP[FLAGS.azure_storage_type],
-          disk.LEGACY_DISK_TYPE: disk.STANDARD
-      }
+          HOST_CACHING: self.host_caching,
+      })
     elif self.disk_type == disk.LOCAL:
       media = disk.SSD if LocalDiskIsSSD(machine_type) else disk.HDD
 
-      self.metadata = {
+      self.metadata.update({
           disk.MEDIA: media,
           disk.REPLICATION: disk.NONE,
-          disk.LEGACY_DISK_TYPE: disk.LOCAL
-      }
+      })
 
   def _Create(self):
     """Creates the disk."""
-
-    if self.disk_type == PREMIUM_STORAGE:
-      assert FLAGS.azure_storage_type == azure_flags.PLRS
-    else:
-      assert FLAGS.azure_storage_type != azure_flags.PLRS
+    assert not self.is_image
 
     with self._lock:
-      create_cmd = [AZURE_PATH,
-                    'vm',
-                    'disk',
-                    'attach-new',
-                    '--host-caching=%s' % self.host_caching,
-                    self.vm_name,
-                    str(self.disk_size)]
-      vm_util.IssueRetryableCommand(create_cmd)
+      _, _, retcode = vm_util.IssueCommand(
+          [azure.AZURE_PATH, 'vm', 'disk', 'attach', '--new',
+           '--caching', self.host_caching, '--disk', self.name,
+           '--lun', str(self.lun), '--sku', self.disk_type,
+           '--vm-name', self.vm_name, '--size-gb', str(self.disk_size)] +
+          self.resource_group.args)
 
-      if self.vm_name not in AzureDisk.num_disks:
-        AzureDisk.num_disks[self.vm_name] = 0
-      self.lun = AzureDisk.num_disks[self.vm_name]
-      AzureDisk.num_disks[self.vm_name] += 1
-      self.created = True
+      if retcode:
+        raise errors.Resource.RetryableCreationError(
+            'Error creating Azure disk.')
 
   def _Delete(self):
     """Deletes the disk."""
-    delete_cmd = [AZURE_PATH,
-                  'vm',
-                  'disk',
-                  'delete',
-                  '--blob-delete',
-                  self.name]
-    logging.info('Deleting disk %s. This may fail while the associated VM '
-                 'is deleted, but will be retried.', self.name)
-    vm_util.IssueCommand(delete_cmd)
+    assert not self.is_image
+    self._deleted = True
 
   def _Exists(self):
     """Returns true if the disk exists."""
-    if self.name is None and self.created:
-      return True
-    elif self.name is None:
+    assert not self.is_image
+    if self._deleted:
       return False
-    show_cmd = [AZURE_PATH,
-                'vm',
-                'disk',
-                'show',
-                '--json',
-                self.name]
-    stdout, _, _ = vm_util.IssueCommand(show_cmd, suppress_warning=True)
+
+    stdout, _, _ = vm_util.IssueCommand(
+        [azure.AZURE_PATH, 'disk', 'show',
+         '--output', 'json',
+         '--name', self.name] + self.resource_group.args)
     try:
       json.loads(stdout)
-    except ValueError:
+      return True
+    except:
       return False
-    return True
-
-  @vm_util.Retry()
-  def _PostCreate(self):
-    """Get the disk's name."""
-    show_cmd = [AZURE_PATH,
-                'vm',
-                'show',
-                '--json',
-                self.vm_name]
-    stdout, _, _ = vm_util.IssueCommand(show_cmd)
-    response = json.loads(stdout)
-    data_disk = response['DataDisks'][self.lun]
-    assert ((self.lun == 0 and 'logicalUnitNumber' not in data_disk)
-            or (self.lun == int(data_disk['logicalUnitNumber'])))
-    self.name = data_disk['name']
 
   def Attach(self, vm):
     """Attaches the disk to a VM.
@@ -183,7 +153,9 @@ class AzureDisk(disk.BaseDisk):
 
   def Detach(self):
     """Detaches the disk from a VM."""
-    pass  # TODO(user): Implement Detach()
+    # Not needed since the resource group can be deleted
+    # without detaching disks.
+    pass
 
   def GetDevicePath(self):
     """Returns the path to the device inside the VM."""

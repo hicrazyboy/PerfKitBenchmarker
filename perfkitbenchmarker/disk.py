@@ -25,6 +25,13 @@ from perfkitbenchmarker import resource
 from perfkitbenchmarker.configs import option_decoders
 from perfkitbenchmarker.configs import spec
 
+flags.DEFINE_boolean('nfs_timeout_hard', True,
+                     'Whether to use hard or soft for NFS mount.')
+flags.DEFINE_integer('nfs_rsize', 1048576, 'NFS read size.')
+flags.DEFINE_integer('nfs_wsize', 1048576, 'NFS write size.')
+flags.DEFINE_integer('nfs_timeout', 60, 'NFS timeout.')
+flags.DEFINE_integer('nfs_retries', 2, 'NFS Retries.')
+
 FLAGS = flags.FLAGS
 
 
@@ -41,6 +48,11 @@ PIOPS = 'piops'  # Provisioned IOPS (SSD) in AWS and Alicloud
 # until that changes, 'local' is a special disk type.
 LOCAL = 'local'
 
+RAM = 'ram'
+
+# refers to disks that come from a cloud NFS service
+NFS = 'nfs'
+
 # Map old disk type names to new disk type names
 DISK_TYPE_MAPS = dict()
 
@@ -53,7 +65,9 @@ SSD = 'ssd'
 NONE = 'none'
 ZONE = 'zone'
 REGION = 'region'
-LEGACY_DISK_TYPE = 'legacy_disk_type'
+
+DEFAULT_MOUNT_OPTIONS = 'discard'
+DEFAULT_FSTAB_OPTIONS = 'defaults'
 
 
 # TODO(nlavine): remove this function when we remove the deprecated
@@ -76,24 +90,9 @@ def RegisterDiskTypeMap(provider_name, type_map):
   DISK_TYPE_MAPS[provider_name] = type_map
 
 
-_DISK_SPEC_REGISTRY = {}
-
-
 def GetDiskSpecClass(cloud):
   """Get the DiskSpec class corresponding to 'cloud'."""
-  return _DISK_SPEC_REGISTRY.get(cloud, BaseDiskSpec)
-
-
-class AutoRegisterDiskSpecMeta(spec.BaseSpecMetaClass):
-  """Metaclass which automatically registers DiskSpecs."""
-
-  def __init__(cls, name, bases, dct):
-    super(AutoRegisterDiskSpecMeta, cls).__init__(name, bases, dct)
-    if cls.CLOUD in _DISK_SPEC_REGISTRY:
-      raise Exception('BaseDiskSpec subclasses must have a CLOUD attribute.')
-    else:
-      _DISK_SPEC_REGISTRY[cls.CLOUD] = cls
-    super(AutoRegisterDiskSpecMeta, cls).__init__(name, bases, dct)
+  return spec.GetSpecClass(BaseDiskSpec, CLOUD=cloud)
 
 
 def WarnAndTranslateDiskTypes(name, cloud):
@@ -125,6 +124,10 @@ def WarnAndTranslateDiskTypes(name, cloud):
 
 def WarnAndCopyFlag(old_name, new_name):
   """Copy a value from an old flag to a new one, warning the user.
+
+  Args:
+    old_name: old name of flag.
+    new_name: new name of flag.
   """
 
   if FLAGS[old_name].present:
@@ -173,7 +176,7 @@ class BaseDiskSpec(spec.BaseSpec):
         1, it means no striping will occur. This must be >= 1.
   """
 
-  __metaclass__ = AutoRegisterDiskSpecMeta
+  SPEC_TYPE = 'BaseDiskSpec'
   CLOUD = None
 
   @classmethod
@@ -201,6 +204,18 @@ class BaseDiskSpec(spec.BaseSpec):
       config_values['num_striped_disks'] = flag_values.num_striped_disks
     if flag_values['scratch_dir'].present:
       config_values['mount_point'] = flag_values.scratch_dir
+    if flag_values['nfs_version'].present:
+      config_values['nfs_version'] = flag_values.nfs_version
+    if flag_values['nfs_timeout_hard'].present:
+      config_values['nfs_timeout_hard'] = flag_values.nfs_timeout_hard
+    if flag_values['nfs_rsize'].present:
+      config_values['nfs_rsize'] = flag_values.nfs_rsize
+    if flag_values['nfs_wsize'].present:
+      config_values['nfs_wsize'] = flag_values.nfs_wsize
+    if flag_values['nfs_timeout'].present:
+      config_values['nfs_timeout'] = flag_values.nfs_timeout
+    if flag_values['nfs_retries'].present:
+      config_values['nfs_retries'] = flag_values.nfs_retries
 
   @classmethod
   def _GetOptionDecoderConstructions(cls):
@@ -227,7 +242,14 @@ class BaseDiskSpec(spec.BaseSpec):
         'mount_point': (option_decoders.StringDecoder, {'default': None,
                                                         'none_ok': True}),
         'num_striped_disks': (option_decoders.IntDecoder, {'default': 1,
-                                                           'min': 1})})
+                                                           'min': 1}),
+        'nfs_version': (option_decoders.StringDecoder, {'default': None}),
+        'nfs_rsize': (option_decoders.IntDecoder, {'default': 1048576}),
+        'nfs_wsize': (option_decoders.IntDecoder, {'default': 1048576}),
+        'nfs_timeout': (option_decoders.IntDecoder, {'default': 60}),
+        'nfs_timeout_hard': (option_decoders.BooleanDecoder, {'default': True}),
+        'nfs_retries': (option_decoders.IntDecoder, {'default': 2}),
+    })
     return result
 
 
@@ -242,6 +264,11 @@ class BaseDisk(resource.BaseResource):
     self.disk_type = disk_spec.disk_type
     self.mount_point = disk_spec.mount_point
     self.num_striped_disks = disk_spec.num_striped_disks
+    self.metadata.update({
+        'type': self.disk_type,
+        'size': self.disk_size,
+        'num_stripes': self.num_striped_disks,
+    })
 
     # Linux related attributes.
     self.device_path = disk_spec.device_path
@@ -256,6 +283,27 @@ class BaseDisk(resource.BaseResource):
     # numbers are used in diskpart scripts in order to identify the disks
     # that we want to operate on.
     self.disk_number = disk_spec.disk_number
+
+  @property
+  def mount_options(self):
+    """Returns options to mount a disk.
+
+    The default value 'discard' is from the linux VM's MountDisk method.
+
+    See `man 8 mount` for usage.  For example, returning "ro" will cause the
+    mount command to be "mount ... -o ro ..." mounting the disk as read only.
+    """
+    return DEFAULT_MOUNT_OPTIONS
+
+  @property
+  def fstab_options(self):
+    """Returns options to use in the /etc/fstab entry for this drive.
+
+    The default value 'defaults' is from the linux VM's MountDisk method.
+
+    See `man fstab` for usage.
+    """
+    return DEFAULT_FSTAB_OPTIONS
 
   @abc.abstractmethod
   def Attach(self, vm):
@@ -295,10 +343,12 @@ class StripedDisk(BaseDisk):
     Args:
       disk_spec: A BaseDiskSpec containing the desired mount point.
       disks: A list of BaseDisk objects that constitute the StripedDisk.
-      device_path: The path of the striped device in a Linux VM.
     """
     super(StripedDisk, self).__init__(disk_spec)
     self.disks = disks
+    self.metadata = disks[0].metadata.copy()
+    if self.disk_size:
+      self.metadata['size'] = self.disk_size * self.num_striped_disks
 
   def _Create(self):
     for disk in self.disks:
@@ -315,3 +365,105 @@ class StripedDisk(BaseDisk):
   def Detach(self):
     for disk in self.disks:
       disk.Detach()
+
+
+class RamDisk(BaseDisk):
+  """Object representing a Ram Disk."""
+
+  def Attach(self, vm):
+    """Attaches the disk to a VM.
+
+    Args:
+      vm: The BaseVirtualMachine instance to which the disk will be attached.
+    """
+    pass
+
+  def Detach(self):
+    """Detaches the disk from a VM."""
+    pass
+
+  def GetDevicePath(self):
+    """Returns the path to the device inside a Linux VM."""
+    return None
+
+  def GetDeviceId(self):
+    """Return the Windows DeviceId of this disk."""
+    return None
+
+  def _Create(self):
+    """Creates the disk."""
+    pass
+
+  def _Delete(self):
+    """Deletes the disk."""
+    pass
+
+
+# TODO(chriswilkes): adds to the disk.GetDiskSpecClass registry
+# that only has the cloud as the key.  Look into using (cloud, disk_type)
+# if causes problems
+class NfsDisk(BaseDisk):
+  """Provides options for mounting NFS drives.
+
+  NFS disk should be ready to mount at the time of creation of this disk.
+
+  Args:
+    disk_spec: The disk spec.
+    remote_mount_address: The host_address:/volume path to the NFS drive.
+    nfs_tier: The NFS tier / performance level of the server.
+  """
+
+  def __init__(self, disk_spec, remote_mount_address, default_nfs_version=None,
+               nfs_tier=None):
+    super(NfsDisk, self).__init__(disk_spec)
+    self.nfs_version = disk_spec.nfs_version or default_nfs_version
+    self.nfs_timeout_hard = disk_spec.nfs_timeout_hard
+    self.nfs_rsize = disk_spec.nfs_rsize
+    self.nfs_wsize = disk_spec.nfs_wsize
+    self.nfs_timeout = disk_spec.nfs_timeout
+    self.nfs_retries = disk_spec.nfs_retries
+    self.device_path = remote_mount_address
+    for key, value in self._GetNfsMountOptionsDict().iteritems():
+      self.metadata['nfs_{}'.format(key)] = value
+    if nfs_tier:
+      self.metadata['nfs_tier'] = nfs_tier
+
+  def _GetNfsMountOptionsDict(self):
+    """Default NFS mount options as a dict."""
+    options = {
+        'hard' if self.nfs_timeout_hard else 'soft': None,
+        'rsize': self.nfs_rsize,
+        'wsize': self.nfs_wsize,
+        'timeo': self.nfs_timeout * 10,  # in decaseconds
+        'retrans': self.nfs_retries
+    }
+    # the client doesn't have to specify an NFS version to use (but should)
+    if self.nfs_version:
+      options['nfsvers'] = self.nfs_version
+    return options
+
+  @property
+  def mount_options(self):
+    opts = []
+    for key, value in sorted(self._GetNfsMountOptionsDict().iteritems()):
+      opts.append('%s' % key if value is None else '%s=%s' % (key, value))
+    return ','.join(opts)
+
+  @property
+  def fstab_options(self):
+    return self.mount_options
+
+  def Attach(self, vm):
+    self.vm = vm
+    self.vm.Install('nfs_utils')
+
+  def Detach(self):
+    self.vm.RemoteCommand('sudo umount %s' % self.mount_point)
+
+  def _Create(self):
+    # handled by the NFS service
+    pass
+
+  def _Delete(self):
+    # handled by the NFS service
+    pass

@@ -75,6 +75,40 @@ class ExtractFloatTestCase(unittest.TestCase):
                       group=1)
 
 
+class ExtractAllFloatMetricsTestCase(unittest.TestCase):
+
+  def testParseSuccessful(self):
+    matches = regex_util.ExtractAllFloatMetrics(
+        """
+        metric=value
+        a=1
+        b=2.0
+        c=.3
+        d=-4.5
+        ef=3.2e+2
+        """)
+    self.assertEqual(len(matches), 5)
+    self.assertEqual(1.0, matches['a'])
+    self.assertEqual(2.0, matches['b'])
+    self.assertEqual(0.3, matches['c'])
+    self.assertEqual(-4.5, matches['d'])
+    self.assertEqual(3.2e+2, matches['ef'])
+
+  def testInvalidMetricRegex(self):
+    self.assertRaises(
+        NotImplementedError,
+        regex_util.ExtractAllFloatMetrics,
+        'metric=1.0',
+        metric_regex=r'\w(\w)')
+
+  def testIntegerValueRegex(self):
+    matches = regex_util.ExtractAllFloatMetrics(
+        'a=1.2,b=3', value_regex=r'\d+')
+    self.assertEqual(len(matches), 2)
+    self.assertEqual(1.0, matches['a'])
+    self.assertEqual(3, matches['b'])
+
+
 class ExtractAllMatchesTestCase(unittest.TestCase):
 
   def testParseSuccessfully(self):
@@ -92,6 +126,25 @@ class ExtractAllMatchesTestCase(unittest.TestCase):
     string = 'test no match'
     self.assertRaises(regex_util.NoMatchError, regex_util.ExtractAllMatches,
                       regex, string)
+
+
+class ExtractExactlyOneMatchTestCase(unittest.TestCase):
+  def testNoMatch(self):
+    with self.assertRaises(regex_util.NoMatchError):
+      regex_util.ExtractExactlyOneMatch('foo', 'bar')
+
+  def testNonUniqueMatch(self):
+    with self.assertRaises(regex_util.TooManyMatchesError):
+      regex_util.ExtractExactlyOneMatch('spam', 'spam spam spam')
+
+  def testNoCapturingGroup(self):
+    self.assertEqual(regex_util.ExtractExactlyOneMatch('bar+', 'foo barrr baz'),
+                     'barrr')
+
+  def testCapturingGroup(self):
+    self.assertEqual(
+        regex_util.ExtractExactlyOneMatch('ba(r+)', 'foo barrr baz'),
+        'rrr')
 
 
 class SubstituteTestCase(unittest.TestCase):

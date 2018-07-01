@@ -28,11 +28,24 @@ from perfkitbenchmarker.linux_packages import docker
 
 FLAGS = flags.FLAGS
 
+flags.DEFINE_integer('cloudsuite_data_serving_rec_count',
+                     1000,
+                     'Record count in the database.',
+                     lower_bound=1)
+
+flags.DEFINE_integer('cloudsuite_data_serving_op_count',
+                     1000,
+                     'Operation count to be executed.',
+                     lower_bound=1)
+
 BENCHMARK_NAME = 'cloudsuite_data_serving'
 BENCHMARK_CONFIG = """
 cloudsuite_data_serving:
   description: >
       Run YCSB client against Cassandra servers.
+      Specify record count and operation count with
+      --cloudsuite_data_serving_rec_count and
+      --cloudsuite_data_serving_op_count.
   vm_groups:
     server_seed:
       vm_spec: *default_single_core
@@ -70,13 +83,13 @@ def Prepare(benchmark_spec):
 
   def PrepareServerSeed(vm):
     PrepareCommon(vm)
-    vm.RemoteCommand('sudo docker pull cloudsuite/data-serving:server')
+    vm.Install('cloudsuite/data-serving:server')
     vm.RemoteCommand('sudo docker run -d --name cassandra-server-seed '
                      '--net host cloudsuite/data-serving:server')
 
   def PrepareServer(vm):
     PrepareCommon(vm)
-    vm.RemoteCommand('sudo docker pull cloudsuite/data-serving:server')
+    vm.Install('cloudsuite/data-serving:server')
     start_server_cmd = ('sudo docker run -d --name cassandra-server '
                         '-e CASSANDRA_SEEDS=%s --net host '
                         'cloudsuite/data-serving:server' %
@@ -85,7 +98,7 @@ def Prepare(benchmark_spec):
 
   def PrepareClient(vm):
     PrepareCommon(vm)
-    vm.RemoteCommand('sudo docker pull cloudsuite/data-serving:client')
+    vm.Install('cloudsuite/data-serving:client')
 
   target_arg_tuples = ([(PrepareServerSeed, [server_seed], {})] +
                        [(PrepareServer, [vm], {}) for vm in servers] +
@@ -116,8 +129,12 @@ def Run(benchmark_spec):
 
   server_ips = ','.join(server_ips_arr)
 
-  benchmark_cmd = ('sudo docker run --rm --name cassandra-client --net host '
-                   'cloudsuite/data-serving:client %s' % server_ips)
+  rec_count_cfg = '-e RECORDCOUNT=%d' % FLAGS.cloudsuite_data_serving_rec_count
+  op_count_cfg = '-e OPERATIONCOUNT=%d' % FLAGS.cloudsuite_data_serving_op_count
+
+  benchmark_cmd = ('sudo docker run %s %s --rm --name cassandra-client'
+                   ' --net host cloudsuite/data-serving:client %s' %
+                   (rec_count_cfg, op_count_cfg, server_ips))
   stdout, _ = client.RemoteCommand(benchmark_cmd, should_log=True)
 
   def GetResults(match_str, result_label, result_metric):
@@ -181,11 +198,9 @@ def Cleanup(benchmark_spec):
   """
   server_seed = benchmark_spec.vm_groups['server_seed'][0]
   servers = benchmark_spec.vm_groups['servers']
-  client = benchmark_spec.vm_groups['client'][0]
 
   def CleanupServerCommon(vm):
     vm.RemoteCommand('sudo docker rm cassandra-server')
-    vm.RemoteCommand('sudo docker rmi cloudsuite/data-serving:server')
 
   def CleanupServerSeed(vm):
     vm.RemoteCommand('sudo docker stop cassandra-server-seed')
@@ -195,10 +210,6 @@ def Cleanup(benchmark_spec):
     vm.RemoteCommand('sudo docker stop cassandra-server')
     CleanupServerCommon(vm)
 
-  def CleanupClient(vm):
-    vm.RemoteCommand('sudo docker rmi cloudsuite/data-serving:client')
-
   target_arg_tuples = ([(CleanupServerSeed, [server_seed], {})] +
-                       [(CleanupServer, [vm], {}) for vm in servers] +
-                       [(CleanupClient, [client], {})])
+                       [(CleanupServer, [vm], {}) for vm in servers])
   vm_util.RunParallelThreads(target_arg_tuples, len(target_arg_tuples))
