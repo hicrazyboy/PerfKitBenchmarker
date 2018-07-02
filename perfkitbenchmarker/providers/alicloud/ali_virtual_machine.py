@@ -145,7 +145,6 @@ class AliVirtualMachine(virtual_machine.BaseVirtualMachine):
       allocatip_cmd = util.ALI_PREFIX + [
           'ecs',
           'AllocateEipAddress',
-          '--Bandwidth 200',
           '--RegionId %s' % region,
           '--InternetChargeType PayByTraffic',
           '--Bandwidth %s' % self.eip_address_bandwidth]

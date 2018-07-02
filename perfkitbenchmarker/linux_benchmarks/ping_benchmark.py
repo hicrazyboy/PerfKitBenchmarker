@@ -22,7 +22,6 @@ import logging
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import sample
-from perfkitbenchmarker import flags
 import re
 
 flags.DEFINE_boolean('ping_also_run_using_external_ip', False,
@@ -49,10 +48,7 @@ flags.DEFINE_boolean('ping_use_external_ip', False, 'Runs ping using '
                                                     'external ip or internal ip.')
 METRICS = ('Min Latency', 'Average Latency', 'Max Latency', 'Latency Std Dev', 'Packet loss rate')
 FLAGS = flags.FLAGS
-#ALI_REGIONS = {
-#  '10.0.1.1': 'CN-Hangzhou',
-#  '192.168.1.1': 'US-West'
-#}
+
 
 def GetConfig(user_config):
   return configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
