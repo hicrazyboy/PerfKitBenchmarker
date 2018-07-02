@@ -20,7 +20,7 @@ ioengine=libaio
 [sequential_write]
 overwrite=0
 rw=write
-blocksize=512k
+blocksize=64k
 size=10*10*1000*$mb_memory
 iodepth=64
 direct=1
@@ -31,7 +31,7 @@ stonewall
 invalidate=1
 overwrite=0
 rw=read
-blocksize=512k
+blocksize=64k
 size=10*10*1000*$mb_memory
 iodepth=64
 direct=1
@@ -59,7 +59,7 @@ stonewall
 overwrite=1
 rw=randwrite
 blocksize=4k
-iodepth=1
+iodepth=128
 size=10*1000*$mb_memory
 direct=1
 
@@ -68,7 +68,7 @@ invalidate=1
 stonewall
 rw=randread
 blocksize=4k
-iodepth=64
+iodepth=128
 size=10*1000*$mb_memory
 direct=1
 
@@ -77,6 +77,6 @@ invalidate=1
 stonewall
 rw=randrw
 blocksize=4k
-iodepth=64
+iodepth=128
 size=10*1000*$mb_memory
 direct=1
